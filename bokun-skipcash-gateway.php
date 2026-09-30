@@ -217,7 +217,7 @@ class Bokun_SkipCash_Plugin {
         wp_localize_script('bokun-booking-scripts', 'BokunSkipCashConfig', array(
             'ajaxUrl'   => admin_url('admin-ajax.php'),
             'restUrl'   => esc_url_raw(rest_url('bokun-skipcash/v1/')),
-            'nonce'     => wp_create_nonce('bokun_skipcash_booking_nonce'),
+            'nonce'     => wp_create_nonce('bokun_skipcash_booking_nonce'), // sent by JS as X-Bokun-Nonce on POST /reserve
             'currency'  => get_option('bokun_skipcash_currency', 'QAR'),
             'timeoutMin'=> BOKUN_SKIPCASH_TIMEOUT_MINUTES
         ));

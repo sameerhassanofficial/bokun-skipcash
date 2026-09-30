@@ -102,9 +102,30 @@ class Bokun_SkipCash_Booking_Controller {
      * Permission: requests must carry a valid frontend booking nonce.
      */
     public function permission_frontend_nonce(WP_REST_Request $request) {
+        // Nonces are only meaningful for logged-out/regular visitors; a logged-in
+        // user is additionally checked against their session capability. Guests must
+        // present the booking nonce issued by BokunSkipCashConfig (JS sends it in the
+        // X-Bokun-Nonce header). If the localized config was not printed (e.g. the
+        // script handle was re-registered after wp_localize_script ran), fall back to
+        // WordPress' standard 'wp_rest' nonce sent via the X-Wp-Nonce header.
         $nonce = $request->get_header('X-Bokun-Nonce') ?: $request->get_param('_wpnonce');
-        if (empty($nonce) || !wp_verify_nonce(sanitize_text_field(wp_unslash($nonce)), 'bokun_skipcash_booking_nonce')) {
-            return new WP_Error('bokun_invalid_nonce', 'Security check failed. Please refresh the page and try again.', array('status' => 403));
+        $nonce_verified = false;
+        if (!empty($nonce)) {
+            $nonce = sanitize_text_field(wp_unslash($nonce));
+            $nonce_verified = wp_verify_nonce($nonce, 'bokun_skipcash_booking_nonce') || wp_verify_nonce($nonce, 'wp_rest');
+        }
+        if (!$nonce_verified) {
+            $wp_nonce = $request->get_header('X-Wp-Nonce');
+            if (!empty($wp_nonce) && wp_verify_nonce(sanitize_text_field(wp_unslash($wp_nonce)), 'wp_rest')) {
+                $nonce_verified = true;
+            }
+        }
+        if (!$nonce_verified) {
+            return new WP_Error(
+                'bokun_invalid_nonce',
+                'Security check failed. Please refresh the page and try again.',
+                array('status' => 403)
+            );
         }
         if (!Bokun_Rate_Limiter::allow('reserve', 8, 60)) {
             return new WP_Error('bokun_rate_limited', 'Too many booking attempts. Please wait a minute and try again.', array('status' => 429));
@@ -1240,8 +1261,13 @@ class Bokun_SkipCash_Booking_Controller {
             return new WP_REST_Response(array('success' => false, 'message' => 'Missing booking code'), 400);
         }
 
-        $record = get_transient('bokun_res_' . $code);
-        if ($record && $record['status'] === 'CONFIRMED') {
+        // Durable reservation store (transients could be evicted / object cache disabled).
+        $record = $this->store->get_by_code($code);
+        if (!$record) {
+            return new WP_REST_Response(array('success' => false, 'status' => 'NOT_FOUND', 'message' => 'Reservation not found or expired.'), 404);
+        }
+
+        if (($record['status'] ?? '') === 'CONFIRMED') {
             return new WP_REST_Response(array(
                 'success'          => true,
                 'status'           => 'CONFIRMED',
@@ -1251,8 +1277,31 @@ class Bokun_SkipCash_Booking_Controller {
         }
 
         $payment_id = sanitize_text_field($request['paymentId'] ?? ($record['skipcash_payment_id'] ?? ''));
-        $amount = floatval($record['amount'] ?? ($request['amount'] ?? 0));
-        $currency = $record['currency'] ?? get_option('bokun_skipcash_currency', 'QAR');
+        $amount     = floatval($record['amount'] ?? 0);
+        $currency   = $record['currency'] ?? get_option('bokun_skipcash_currency', 'QAR');
+
+        // Server-side payment verification ONLY: never confirm a Bókun reservation
+        // because the browser claims it came back from SkipCash. Query the SkipCash
+        // API for the authoritative status first.
+        $is_paid = false;
+        if (!empty($payment_id)) {
+            $status_check = $this->skipcash->get_payment_status($payment_id);
+            if (!empty($status_check)) {
+                $st_id  = intval($status_check['resultObj']['statusId'] ?? ($status_check['statusId'] ?? 0));
+                $st_str = strtolower($status_check['resultObj']['status'] ?? ($status_check['status'] ?? ''));
+                if ($st_id === 2 || $st_str === 'paid' || !empty($status_check['resultObj']['paidDate'])) {
+                    $is_paid = true;
+                }
+            }
+        }
+
+        if (!$is_paid) {
+            return new WP_REST_Response(array(
+                'success' => false,
+                'status'  => $record['status'] ?? 'RESERVED',
+                'message' => 'Awaiting payment confirmation'
+            ), 200);
+        }
 
         $tx_details = array(
             'transactionDate' => gmdate('Y-m-d H:i:s'),
@@ -1271,19 +1320,10 @@ class Bokun_SkipCash_Booking_Controller {
         );
 
         if ($is_confirmed_ok) {
-            if (!$record) {
-                $record = array(
-                    'confirmationCode' => $code,
-                    'amount'           => $amount,
-                    'currency'         => $currency,
-                    'customer'         => array('firstName' => 'Valued', 'lastName' => 'Guest', 'email' => ''),
-                    'activity_name'    => 'Tour Booking'
-                );
-            }
+            $this->store->mark_confirmed($code, $payment_id);
             $record['status'] = 'CONFIRMED';
             $record['confirmed_at'] = time();
             $record['skipcash_payment_id'] = $payment_id;
-            // No transient cache
 
             return new WP_REST_Response(array(
                 'success'          => true,
@@ -1296,18 +1336,9 @@ class Bokun_SkipCash_Booking_Controller {
         // Check if Bókun itself already has it as CONFIRMED
         $bk_check = $this->bokun->get_booking_by_confirmation_code($code);
         if (!empty($bk_check) && ($bk_check['status'] ?? '') === 'CONFIRMED') {
-            if (!$record) {
-                $record = array(
-                    'confirmationCode' => $code,
-                    'amount'           => $amount,
-                    'currency'         => $currency,
-                    'customer'         => array('firstName' => 'Valued', 'lastName' => 'Guest', 'email' => ''),
-                    'activity_name'    => 'Tour Booking'
-                );
-            }
+            $this->store->mark_confirmed($code, $payment_id);
             $record['status'] = 'CONFIRMED';
             $record['confirmed_at'] = time();
-            // No transient cache
 
             return new WP_REST_Response(array(
                 'success'          => true,
@@ -1326,7 +1357,8 @@ class Bokun_SkipCash_Booking_Controller {
 
     public function handle_get_status(WP_REST_Request $request) {
         $code = sanitize_text_field($request['code']);
-        $record = get_transient('bokun_res_' . $code);
+        // Read from the durable reservation store instead of transients.
+        $record = $this->store->get_by_code($code);
 
         if (!$record) {
             return new WP_REST_Response(array('status' => 'NOT_FOUND_OR_EXPIRED'), 404);
