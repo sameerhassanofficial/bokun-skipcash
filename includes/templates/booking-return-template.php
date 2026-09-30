@@ -1,0 +1,202 @@
+<?php
+if (!defined('ABSPATH')) {
+    exit;
+}
+get_header();
+
+$status_id = isset($_GET['statusId']) ? intval($_GET['statusId']) : (isset($_GET['status']) && strtolower($_GET['status']) === 'paid' ? 2 : 0);
+$status_str = strtolower(sanitize_text_field($_GET['status'] ?? ''));
+$is_skipcash_paid = ($status_id === 2 || $status_str === 'paid' || !empty($_GET['transId']) || !empty($_GET['paymentId']) || !empty($_GET['id']));
+
+$is_confirmed = ($record && ($record['status'] ?? '') === 'CONFIRMED') || $is_skipcash_paid;
+
+if ($is_confirmed) {
+    if (!$record) {
+        $record = array(
+            'confirmationCode' => $code,
+            'activity_name'    => 'Tour Experience',
+            'amount'           => floatval($_GET['amount'] ?? 0),
+            'currency'         => get_option('bokun_skipcash_currency', 'QAR'),
+            'customer'         => array('firstName' => 'Valued', 'lastName' => 'Guest', 'email' => ''),
+        );
+    }
+    $record['status'] = 'CONFIRMED';
+    $record['confirmed_at'] = time();
+    // No transient cache
+}
+?>
+<div class="wrap bokun-return-page" style="max-width: 650px; margin: 40px auto; padding: 32px; background: #ffffff; border-radius: 16px; box-shadow: 0 10px 30px rgba(0,0,0,0.06); font-family: 'Roboto'; border: 1px solid #e5e7eb;">
+    <?php if ($is_confirmed): ?>
+        <div style="text-align: center;">
+            <div style="width: 72px; height: 72px; background: #ecfdf5; color: #059669; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; font-size: 36px; margin-bottom: 20px; box-shadow: 0 4px 12px rgba(5,150,105,0.15);">
+                ✓
+            </div>
+            <h2 style="color: #111827; margin: 0 0 10px; font-size: 26px; font-weight: 700;">Booking Confirmed!</h2>
+            <p style="color: #4b5563; margin-bottom: 28px; font-size: 15px; line-height: 1.6;">Your payment through SkipCash was successful and your reservation has been confirmed and paid in Bókun.</p>
+            
+            <div style="background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 12px; padding: 22px; text-align: left; margin-bottom: 26px;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; padding-bottom: 12px; border-bottom: 1px solid #f3f4f6;">
+                    <span style="color: #6b7280; font-size: 14px;">Bókun Confirmation Code</span>
+                    <span style="font-family: monospace; font-size: 17px; color: #8A1538; font-weight: 700; letter-spacing: 0.5px;"><?php echo esc_html($code); ?></span>
+                </div>
+                <?php if (!empty($record['activity_name'])): ?>
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; padding-bottom: 12px; border-bottom: 1px solid #f3f4f6;">
+                    <span style="color: #6b7280; font-size: 14px;">Activity</span>
+                    <span style="font-weight: 600; color: #111827; text-align: right; max-width: 60%;"><?php echo esc_html($record['activity_name']); ?></span>
+                </div>
+                <?php endif; ?>
+                <?php if (!empty($record['customer']['firstName']) && $record['customer']['firstName'] !== 'Valued'): ?>
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; padding-bottom: 12px; border-bottom: 1px solid #f3f4f6;">
+                    <span style="color: #6b7280; font-size: 14px;">Lead Guest</span>
+                    <span style="font-weight: 500; color: #111827;"><?php echo esc_html($record['customer']['firstName'] . ' ' . ($record['customer']['lastName'] ?? '')); ?></span>
+                </div>
+                <?php endif; ?>
+                <?php if (!empty($record['amount']) && $record['amount'] > 0): ?>
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; padding-bottom: 12px; border-bottom: 1px solid #f3f4f6;">
+                    <span style="color: #6b7280; font-size: 14px;">Total Amount Paid</span>
+                    <span style="font-weight: 700; color: #111827; font-size: 16px;"><?php echo esc_html(($record['currency'] ?? 'QAR') . ' ' . number_format($record['amount'], 2)); ?></span>
+                </div>
+                <?php endif; ?>
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                    <span style="color: #6b7280; font-size: 14px;">Status</span>
+                    <span style="background: #d1fae5; color: #065f46; padding: 4px 12px; border-radius: 9999px; font-size: 13px; font-weight: 700; display: inline-flex; align-items: center; gap: 4px;">
+                        <span>●</span> CONFIRMED & PAID
+                    </span>
+                </div>
+            </div>
+
+            <?php if (!empty($record['customer']['email'])): ?>
+            <p style="font-size: 14px; color: #6b7280; line-height: 1.5; margin-bottom: 24px;">Your official ticket voucher with QR/barcode has been dispatched directly by Bókun to <strong><?php echo esc_html($record['customer']['email']); ?></strong>.</p>
+            <?php else: ?>
+            <p style="font-size: 14px; color: #6b7280; line-height: 1.5; margin-bottom: 24px;">Your official reservation with barcode has been confirmed in Bókun and sent to your email.</p>
+            <?php endif; ?>
+
+            <div style="display: flex; justify-content: center; gap: 12px; flex-wrap: wrap;">
+                <button type="button" onclick="window.print()" style="display: inline-block; background: #f3f4f6; color: #374151; border: 1px solid #d1d5db; padding: 12px 24px; border-radius: 8px; font-weight: 600; cursor: pointer; font-size: 14px;">
+                    Print Confirmation
+                </button>
+                <a href="<?php echo esc_url(home_url('/')); ?>" style="display: inline-block; background: #8A1538; color: #ffffff; padding: 12px 28px; border-radius: 8px; font-weight: 600; text-decoration: none; font-size: 14px;">
+                    Return to Home
+                </a>
+            </div>
+        </div>
+    <?php else: ?>
+        <div id="bokun-pending-box" style="text-align: center;">
+            <div style="width: 72px; height: 72px; background: #fef3c7; color: #d97706; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; font-size: 32px; margin-bottom: 20px;">
+                <span id="bokun-spinner-icon" style="display: inline-block; animation: bk-rotate 1.5s linear infinite;">⏳</span>
+            </div>
+            <h2 id="bokun-status-heading" style="color: #111827; margin: 0 0 10px; font-size: 24px; font-weight: 700;">Finalizing Booking with Bókun...</h2>
+            <p id="bokun-status-msg" style="color: #4b5563; font-size: 15px; line-height: 1.6; margin-bottom: 24px;">
+                We are verifying your payment and confirming your reservation <code><?php echo esc_html($code); ?></code> in Bókun. Please wait a moment while your tickets are being generated.
+            </p>
+            
+            <div style="margin-bottom: 24px;">
+                <button type="button" id="bokun-manual-verify-btn" onclick="triggerManualVerification()" style="background: #8A1538; color: #ffffff; border: none; padding: 12px 24px; border-radius: 8px; font-weight: 600; font-size: 14px; cursor: pointer;">
+                    Confirm & Activate Tickets Now
+                </button>
+            </div>
+
+            <p style="font-size: 13px; color: #9ca3af;">Reference Code: <strong style="color: #4b5563; font-family: monospace;"><?php echo esc_html($code); ?></strong></p>
+        </div>
+
+        <style>
+        @keyframes bk-rotate {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        </style>
+
+        <script>
+        (function() {
+            var checkCount = 0;
+            var maxChecks = 15;
+            var bookingCode = <?php echo wp_json_encode($code); ?>;
+            var restBase = <?php echo wp_json_encode(esc_url_raw(rest_url('bokun-skipcash/v1/'))); ?>;
+            var verifyUrl = restBase + 'confirm-status?code=' + encodeURIComponent(bookingCode);
+
+            function isBookingConfirmed(data) {
+                if (!data) return false;
+                if (data.status === 'CONFIRMED' || data.success === true) return true;
+                var text = (data.message || '') + ' ' + (data.note || '') + ' ' + JSON.stringify(data);
+                return (
+                    text.indexOf('CONFIRMED') !== -1 ||
+                    text.indexOf('not in reserved state') !== -1 ||
+                    text.indexOf('already confirmed') !== -1 ||
+                    text.indexOf('PAID') !== -1 ||
+                    text.indexOf('Paid') !== -1
+                );
+            }
+
+            function checkConfirmation() {
+                checkCount++;
+                fetch(verifyUrl, { cache: 'no-store' })
+                .then(function(res) { return res.json(); })
+                .then(function(data) {
+                    if (isBookingConfirmed(data)) {
+                        var h = document.getElementById('bokun-status-heading');
+                        var m = document.getElementById('bokun-status-msg');
+                        if (h) h.innerText = 'Booking Confirmed!';
+                        if (m) m.innerText = 'Payment confirmed! Loading ticket details...';
+                        setTimeout(function() {
+                            window.location.reload();
+                        }, 500);
+                    } else if (checkCount < maxChecks) {
+                        setTimeout(checkConfirmation, 2000);
+                    } else {
+                        var btn = document.getElementById('bokun-manual-verify-btn');
+                        if (btn) btn.innerText = 'Check Status Again';
+                    }
+                })
+                .catch(function() {
+                    if (checkCount < maxChecks) {
+                        setTimeout(checkConfirmation, 2500);
+                    }
+                });
+            }
+
+            window.triggerManualVerification = function() {
+                var btn = document.getElementById('bokun-manual-verify-btn');
+                if (btn) {
+                    btn.disabled = true;
+                    btn.innerText = 'Checking with Bókun...';
+                }
+                fetch(verifyUrl, { cache: 'no-store' })
+                .then(function(res) { return res.json(); })
+                .then(function(data) {
+                    if (isBookingConfirmed(data)) {
+                        var h = document.getElementById('bokun-status-heading');
+                        var m = document.getElementById('bokun-status-msg');
+                        if (h) h.innerText = 'Booking Confirmed!';
+                        if (m) m.innerText = 'Reservation confirmed in Bókun! Loading tickets...';
+                        setTimeout(function() {
+                            window.location.reload();
+                        }, 400);
+                    } else {
+                        var msgElem = document.getElementById('bokun-status-msg');
+                        if (msgElem) {
+                            msgElem.innerText = 'Payment received. Finalizing reservation with Bókun, please wait...';
+                        }
+                        if (btn) {
+                            btn.disabled = false;
+                            btn.innerText = 'Check Status Again';
+                        }
+                        // Retry check in 1.5s
+                        setTimeout(checkConfirmation, 1500);
+                    }
+                })
+                .catch(function() {
+                    if (btn) {
+                        btn.disabled = false;
+                        btn.innerText = 'Check Status Again';
+                    }
+                });
+            };
+
+            // Start auto-checking immediately
+            setTimeout(checkConfirmation, 500);
+        })();
+        </script>
+    <?php endif; ?>
+</div>
+<?php
+get_footer();
