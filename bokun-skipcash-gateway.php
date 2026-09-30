@@ -3,7 +3,7 @@
  * Plugin Name:       Bókun & SkipCash Booking Gateway
  * Plugin URI:        https://github.com/your-org/bokun-skipcash-gateway
  * Description:       Integrates Bókun Tour Booking API with SkipCash Qatar payment gateway via the RESERVE_FOR_EXTERNAL_PAYMENT flow, replacing the incompatible Bókun widget.
- * Version:           2.7.3
+ * Version:           2.8.0
  * Requires at least: 5.8
  * Requires PHP:      7.4
  * Author:            Tour Operations Team
@@ -11,6 +11,17 @@
  * Text Domain:       bokun-skipcash
  *
  * Changelog:
+ * v2.8.0 (2026-09-30): Security & correctness hardening pass from code review.
+ *  - RESTORED reservation persistence: bookings are now stored in a dedicated {prefix}bokun_reservations table (Bokun_Reservation_Store) so the confirmation flow no longer silently loses reservations ("No transient cache" regression).
+ *  - PAYMENT VERIFICATION: bookings can no longer be confirmed without server-side proof of payment. The return redirect and /confirm-status endpoint now require a signed per-reservation bearer token AND a verified SkipCash API status check (statusId=2/paidDate) before calling Bókun confirm-reserved. The "returned without failure flags => assume paid" heuristic was removed.
+ *  - SERVER-AUTHORITATIVE PRICING: the charged amount is computed on the server from live Bókun availability prices (never max(reservation, client amount)); client-supplied amounts are ignored except as a display hint. Removed the 199 QAR hard-coded price fallback.
+ *  - AUTHENTICATION ON PUBLIC ENDPOINTS: /reserve requires a valid wp nonce (X-Bokun-Nonce header) and rate limiting; /confirm-status and /status require the reservation bearer token; webhooks now REQUIRE valid signatures (SkipCash webhook secret / Bókun HMAC) instead of treating them as optional.
+ *  - REMOVED hard-coded activity/category/rate/startTime IDs (1317760, 1248692, 1248695, 5890195, 2625633, 5772342, 2577246); missing IDs now produce a clear validation error pointing to plugin settings.
+ *  - CACHING: restored proper 5-minute transients for activity details, pricing categories and availabilities (previously deleted on every request, causing uncached upstream HTTP calls during page rendering). Shortcode rendering no longer performs blocking live API calls on every page view.
+ *  - DATA LEAKAGE: public error responses no longer include raw upstream payloads, sent payloads containing customer PII, or internal URLs; details are logged server-side only.
+ *  - ADMIN SETTINGS: register_setting now sanitizes all inputs; secrets are no longer echoed back into password field values.
+ *  - SCRIPT HANDLES: fixed duplicate registration/enqueue with time() version busting; assets now use a stable version and defer loading.
+ *  - Phone/email deep-search heuristics replaced with explicit validated fields; bogus default phone (+97430191237) and email (booking@example.com) fallbacks removed.
  * v1.3.9 (2026-09-29):
  *  - Removed Sunrise and Sunset labels from timesList and departure buttons, replacing them with clean AM/PM designations and converting all 24-hour formats to standard 12-hour AM/PM formats.
  * v1.3.8 (2026-09-29):
@@ -100,7 +111,7 @@ if (!defined('ABSPATH')) {
     exit; // Prevent direct access
 }
 
-define('BOKUN_SKIPCASH_VERSION', '2.7.3');
+define('BOKUN_SKIPCASH_VERSION', '2.8.0');
 define('BOKUN_SKIPCASH_FILE', __FILE__);
 define('BOKUN_SKIPCASH_PATH', plugin_dir_path(__FILE__));
 define('BOKUN_SKIPCASH_URL', plugin_dir_url(__FILE__));
@@ -109,6 +120,8 @@ define('BOKUN_SKIPCASH_TIMEOUT_MINUTES', 30);
 // Require core classes
 require_once BOKUN_SKIPCASH_PATH . 'includes/class-bokun-api.php';
 require_once BOKUN_SKIPCASH_PATH . 'includes/class-skipcash-api.php';
+require_once BOKUN_SKIPCASH_PATH . 'includes/class-reservation-store.php';
+require_once BOKUN_SKIPCASH_PATH . 'includes/class-rate-limiter.php';
 require_once BOKUN_SKIPCASH_PATH . 'includes/class-booking-controller.php';
 require_once BOKUN_SKIPCASH_PATH . 'includes/class-admin-settings.php';
 require_once BOKUN_SKIPCASH_PATH . 'includes/class-shortcode-ui.php';
@@ -121,6 +134,7 @@ class Bokun_SkipCash_Plugin {
 
     public $bokun_api;
     public $skipcash_api;
+    public $store;
     public $controller;
     public $admin;
     public $shortcode;
@@ -136,18 +150,30 @@ class Bokun_SkipCash_Plugin {
         $this->init_components();
         add_action('init', array($this, 'init_plugin'));
         add_action('wp_enqueue_scripts', array($this, 'enqueue_frontend_assets'));
+        // Safety net: ensure table exists even if activation hook did not fire (e.g. dropped in).
+        add_action('plugins_loaded', array('Bokun_Reservation_Store', 'maybe_install'), 20);
+        // Housekeeping for expired holds.
+        add_action('bokun_skipcash_daily_cleanup', array($this, 'run_daily_cleanup'));
     }
 
     private function init_components() {
         $this->bokun_api    = new Bokun_API();
         $this->skipcash_api = new SkipCash_API();
-        $this->controller   = new Bokun_SkipCash_Booking_Controller($this->bokun_api, $this->skipcash_api);
+        $this->store        = new Bokun_Reservation_Store();
+        $this->controller   = new Bokun_SkipCash_Booking_Controller($this->bokun_api, $this->skipcash_api, $this->store);
         $this->admin        = new Bokun_SkipCash_Admin_Settings($this->bokun_api);
         $this->shortcode    = new Bokun_SkipCash_Shortcode_UI($this->bokun_api);
     }
 
+    public function run_daily_cleanup() {
+        $this->store->purge_expired();
+    }
+
     public function init_plugin() {
         load_plugin_textdomain('bokun-skipcash', false, dirname(plugin_basename(__FILE__)) . '/languages');
+        if (!wp_next_scheduled('bokun_skipcash_daily_cleanup')) {
+            wp_schedule_event(time() + 60, 'daily', 'bokun_skipcash_daily_cleanup');
+        }
     }
 
     public function enqueue_frontend_assets() {
@@ -159,15 +185,17 @@ class Bokun_SkipCash_Plugin {
         );
         wp_enqueue_style('bokun-booking-styles');
 
-        wp_register_script('bokun-booking-scripts', BOKUN_SKIPCASH_URL . 'assets/js/bokun-booking.js', array(), time(), false);
-        wp_enqueue_script('bokun-booking-scripts', BOKUN_SKIPCASH_URL . 'assets/js/bokun-booking.js', array(), time(), false);
+        // Register ONCE with a stable version (was previously registered and enqueued
+        // twice with time() cache-busting, defeating browser caching on every request).
+        wp_register_script('bokun-booking-scripts', BOKUN_SKIPCASH_URL . 'assets/js/bokun-booking.js', array(), BOKUN_SKIPCASH_VERSION, true);
+        wp_enqueue_script('bokun-booking-scripts');
 
         wp_localize_script('bokun-booking-scripts', 'BokunSkipCashConfig', array(
             'ajaxUrl'   => admin_url('admin-ajax.php'),
             'restUrl'   => esc_url_raw(rest_url('bokun-skipcash/v1/')),
             'nonce'     => wp_create_nonce('bokun_skipcash_booking_nonce'),
             'currency'  => get_option('bokun_skipcash_currency', 'QAR'),
-            'timeoutMin'=> 30
+            'timeoutMin'=> BOKUN_SKIPCASH_TIMEOUT_MINUTES
         ));
     }
 }
@@ -177,6 +205,7 @@ add_action('plugins_loaded', array('Bokun_SkipCash_Plugin', 'get_instance'));
 
 // Activation Hook
 register_activation_hook(__FILE__, function () {
+    Bokun_Reservation_Store::maybe_install();
     if (!get_option('bokun_skipcash_currency')) {
         update_option('bokun_skipcash_currency', 'QAR');
     }
@@ -186,4 +215,9 @@ register_activation_hook(__FILE__, function () {
     if (!get_option('bokun_skipcash_skipcash_base_url')) {
         update_option('bokun_skipcash_skipcash_base_url', 'https://api.skipcash.app');
     }
+});
+
+// Deactivation Hook
+register_deactivation_hook(__FILE__, function () {
+    wp_clear_scheduled_hook('bokun_skipcash_daily_cleanup');
 });
