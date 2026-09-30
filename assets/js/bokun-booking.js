@@ -1657,39 +1657,64 @@ var isPastCutoff = function(s, dStr) {
                 // Without it the permission callback rejects the request with
                 // "Security check failed. Please refresh the page and try again."
                 var bkNonce = (window.BokunSkipCashConfig && window.BokunSkipCashConfig.nonce) ? window.BokunSkipCashConfig.nonce : '';
+                var wpRestNonce = (window.BokunSkipCashConfig && window.BokunSkipCashConfig.wpRestNonce) ? window.BokunSkipCashConfig.wpRestNonce : '';
                 if (!bkNonce) {
                     logDebug('Booking nonce missing - BokunSkipCashConfig not loaded.', true);
                 }
 
-                fetch(url, {
-                    method: 'POST',
-                    credentials: 'same-origin',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'X-Bokun-Nonce': bkNonce
-                    },
-                    body: JSON.stringify(payload)
-                })
-                .then(function(r) { return r.json(); })
-                .then(function(res) {
-                    var targetUrl = res.payUrl || res.redirectUrl || res.paymentUrl;
-                    if (res.success && targetUrl) {
-                        logDebug('Reservation success! Redirecting to SkipCash: ' + targetUrl);
-                        window.location.href = targetUrl;
-                    } else {
-                        var err = res.message || res.error || (res.details && res.details.message) || 'Could not hold seats on Bókun. Please check if the date/time is available.';
-                        logDebug('Reservation Error: ' + err, true);
-                        if (DOM.errMsg) DOM.errMsg.textContent = err;
+                var submitReserve = function (nonceValue, isRetry) {
+                    fetch(url, {
+                        method: 'POST',
+                        credentials: 'same-origin',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'X-Bokun-Nonce': nonceValue,
+                            'X-Wp-Nonce': wpRestNonce || nonceValue
+                        },
+                        body: JSON.stringify(payload)
+                    })
+                    .then(function(r) { return r.json().then(function(j) { return { status: r.status, body: j }; }); })
+                    .then(function(res) {
+                        var j = res.body || {};
+                        // Stale nonce (cached page or long-open tab): transparently
+                        // re-fetch a fresh nonce from the server and retry once.
+                        if (!isRetry && res.status === 403 && j.code === 'bokun_invalid_nonce') {
+                            logDebug('Nonce rejected by server - refreshing nonce and retrying once.');
+                            return fetch(buildEndpointUrl('nonce', ''), { credentials: 'same-origin' })
+                                .then(function(r) { return r.json(); })
+                                .then(function(n) {
+                                    if (n && n.nonce) {
+                                        if (window.BokunSkipCashConfig) {
+                                            window.BokunSkipCashConfig.nonce = n.nonce;
+                                            window.BokunSkipCashConfig.wpRestNonce = n.wpRestNonce || n.nonce;
+                                        }
+                                        wpRestNonce = n.wpRestNonce || n.nonce;
+                                        return submitReserve(n.nonce, true);
+                                    }
+                                    throw new Error('Could not refresh security token');
+                                });
+                        }
+                        var targetUrl = j.payUrl || j.redirectUrl || j.paymentUrl;
+                        if (j.success && targetUrl) {
+                            logDebug('Reservation success! Redirecting to SkipCash: ' + targetUrl);
+                            window.location.href = targetUrl;
+                        } else {
+                            var err = j.message || j.error || (j.details && j.details.message) || 'Could not hold seats on Bókun. Please check if the date/time is available.';
+                            logDebug('Reservation Error: ' + err, true);
+                            if (DOM.errMsg) DOM.errMsg.textContent = err;
+                            DOM.btnCheckout.disabled = false;
+                            DOM.btnCheckout.innerHTML = '<span>Proceed to Payment</span> <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>';
+                        }
+                    })
+                    .catch(function(err) {
+                        logDebug('Checkout fetch error: ' + err.message, true);
+                        if (DOM.errMsg) DOM.errMsg.textContent = 'Connection error: ' + err.message;
                         DOM.btnCheckout.disabled = false;
                         DOM.btnCheckout.innerHTML = '<span>Proceed to Payment</span> <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>';
-                    }
-                })
-                .catch(function(err) {
-                    logDebug('Checkout fetch error: ' + err.message, true);
-                    if (DOM.errMsg) DOM.errMsg.textContent = 'Connection error: ' + err.message;
-                    DOM.btnCheckout.disabled = false;
-                    DOM.btnCheckout.innerHTML = '<span>Proceed to Payment</span> <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>';
-                });
+                    });
+                };
+
+                submitReserve(bkNonce, false);
             }
         });
     }

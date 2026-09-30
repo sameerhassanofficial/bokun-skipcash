@@ -96,6 +96,37 @@ class Bokun_SkipCash_Booking_Controller {
             'callback'            => array($this, 'handle_verify_and_confirm_status'),
             'permission_callback' => array($this, 'permission_reservation_token')
         ));
+
+        // Fresh-nonce endpoint for the frontend. A booking page can sit open far
+        // longer than a WP nonce window (~24h, or 12-24h after a login/role change),
+        // and full-page caches can serve a stale embedded nonce. When /reserve is
+        // rejected with bokun_invalid_nonce, the JS calls this to get a current
+        // nonce and retries once. Public by design (nonces carry no privilege);
+        // rate-limited to blunt abuse.
+        register_rest_route('bokun-skipcash/v1', '/nonce', array(
+            'methods'             => 'GET',
+            'callback'            => array($this, 'handle_get_fresh_nonce'),
+            'permission_callback' => '__return_true'
+        ));
+    }
+
+    /**
+     * Return freshly minted nonces tied to the caller's current session.
+     */
+    public function handle_get_fresh_nonce(WP_REST_Request $request) {
+        if (!Bokun_Rate_Limiter::allow('nonce', 30, 60)) {
+            return new WP_REST_Response(array('success' => false, 'message' => 'Too many requests.'), 429);
+        }
+        if (!headers_sent()) {
+            header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+            header('Pragma: no-cache');
+            header('Expires: 0');
+        }
+        return new WP_REST_Response(array(
+            'success'     => true,
+            'nonce'       => wp_create_nonce('bokun_skipcash_booking_nonce'),
+            'wpRestNonce' => wp_create_nonce('wp_rest'),
+        ), 200);
     }
 
     /**
@@ -121,6 +152,21 @@ class Bokun_SkipCash_Booking_Controller {
             }
         }
         if (!$nonce_verified) {
+            // Diagnostic aid (WP_DEBUG only): tell us WHICH failure mode happened so
+            // "Security check failed" can be root-caused from the server log instead
+            // of the browser: empty header => config object missing on the page;
+            // non-empty => stale page nonce (cache / long-open tab) or cookie/session
+            // mismatch between page render and this REST request.
+            if (defined('WP_DEBUG') && WP_DEBUG) {
+                error_log(sprintf(
+                    '[Bokun-SkipCash] Nonce rejection on %s %s | header-present=%s uid=%d referer=%s',
+                    $request->get_method(),
+                    $request->get_route(),
+                    !empty($nonce) ? 'yes' : 'no',
+                    get_current_user_id(),
+                    $request->get_header('referer') ?: '-'
+                ));
+            }
             return new WP_Error(
                 'bokun_invalid_nonce',
                 'Security check failed. Please refresh the page and try again.',

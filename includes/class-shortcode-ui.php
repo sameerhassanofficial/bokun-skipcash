@@ -61,15 +61,27 @@ class Bokun_SkipCash_Shortcode_UI {
         // rejected it with "Security check failed. Please refresh the page and try again."
         if (!wp_script_is('bokun-booking-scripts', 'registered')) {
             wp_register_script('bokun-booking-scripts', BOKUN_SKIPCASH_URL . 'assets/js/bokun-booking.js', array(), BOKUN_SKIPCASH_VERSION, true);
-            wp_localize_script('bokun-booking-scripts', 'BokunSkipCashConfig', array(
-                'ajaxUrl'   => admin_url('admin-ajax.php'),
-                'restUrl'   => esc_url_raw(rest_url('bokun-skipcash/v1/')),
-                'nonce'     => wp_create_nonce('bokun_skipcash_booking_nonce'), // sent by JS as X-Bokun-Nonce on POST /reserve
-                'currency'  => get_option('bokun_skipcash_currency', 'QAR'),
-                'timeoutMin'=> defined('BOKUN_SKIPCASH_TIMEOUT_MINUTES') ? BOKUN_SKIPCASH_TIMEOUT_MINUTES : 30
-            ));
         }
         wp_enqueue_script('bokun-booking-scripts');
+
+        // Always route through the plugin's centralized config printer. It uses an
+        // idempotent inline "before" bootstrap so window.BokunSkipCashConfig exists
+        // even when the shortcode renders after the footer scripts have printed
+        // (previously localize-at-render-time produced no output -> missing nonce ->
+        // REST 403 "Security check failed").
+        $plugin = Bokun_SkipCash_Plugin::get_instance();
+        if (method_exists($plugin, 'localize_booking_config')) {
+            $plugin->localize_booking_config();
+        } else {
+            wp_localize_script('bokun-booking-scripts', 'BokunSkipCashConfig', array(
+                'ajaxUrl'    => admin_url('admin-ajax.php'),
+                'restUrl'    => esc_url_raw(rest_url('bokun-skipcash/v1/')),
+                'nonce'      => wp_create_nonce('bokun_skipcash_booking_nonce'),
+                'wpRestNonce' => wp_create_nonce('wp_rest'),
+                'currency'   => get_option('bokun_skipcash_currency', 'QAR'),
+                'timeoutMin' => defined('BOKUN_SKIPCASH_TIMEOUT_MINUTES') ? BOKUN_SKIPCASH_TIMEOUT_MINUTES : 30
+            ));
+        }
         
         ob_start();
         ?>

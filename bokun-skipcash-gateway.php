@@ -214,13 +214,55 @@ class Bokun_SkipCash_Plugin {
         wp_register_script('bokun-booking-scripts', BOKUN_SKIPCASH_URL . 'assets/js/bokun-booking.js', array(), BOKUN_SKIPCASH_VERSION, true);
         wp_enqueue_script('bokun-booking-scripts');
 
-        wp_localize_script('bokun-booking-scripts', 'BokunSkipCashConfig', array(
-            'ajaxUrl'   => admin_url('admin-ajax.php'),
-            'restUrl'   => esc_url_raw(rest_url('bokun-skipcash/v1/')),
-            'nonce'     => wp_create_nonce('bokun_skipcash_booking_nonce'), // sent by JS as X-Bokun-Nonce on POST /reserve
-            'currency'  => get_option('bokun_skipcash_currency', 'QAR'),
-            'timeoutMin'=> BOKUN_SKIPCASH_TIMEOUT_MINUTES
-        ));
+        $this->localize_booking_config();
+    }
+
+    /**
+     * Print BokunSkipCashConfig for the booking script.
+     *
+     * IMPORTANT: wp_localize_script only emits output if it runs BEFORE the
+     * script is actually printed in the page. On cached / Full-Site-Editing
+     * pages the shortcode can render after print_footer_scripts, so relying on
+     * the enqueue-time localize alone intermittently left window.BokunSkipCashConfig
+     * undefined -> JS posted to /reserve without X-Bokun-Nonce -> REST returned
+     * {"code":"bokun_invalid_nonce","message":"Security check failed..."} (403).
+     *
+     * We therefore (a) keep wp_localize_script for the normal path and (b) add an
+     * idempotent inline-boot fallback on wp_head that defines the config object
+     * before any script runs. Both calls produce identical data; whichever fires
+     * first wins and the later one is a no-op guard (`window.X = window.X || {...}`).
+     */
+    public function localize_booking_config() {
+        static $printed = false;
+
+        $config = array(
+            'ajaxUrl'    => admin_url('admin-ajax.php'),
+            'restUrl'    => esc_url_raw(rest_url('bokun-skipcash/v1/')),
+            // Fresh nonce per request, valid ~24h for logged-out visitors and
+            // rotated for logged-in users. Sent by JS as X-Bokun-Nonce on /reserve.
+            'nonce'      => wp_create_nonce('bokun_skipcash_booking_nonce'),
+            'wpRestNonce' => wp_create_nonce('wp_rest'),
+            'currency'   => get_option('bokun_skipcash_currency', 'QAR'),
+            'timeoutMin' => defined('BOKUN_SKIPCASH_TIMEOUT_MINUTES') ? BOKUN_SKIPCASH_TIMEOUT_MINUTES : 30,
+        );
+
+        if (!$printed) {
+            $printed = true;
+            // Normal path: emitted right before the script tag when the action
+            // order is standard (enqueue during wp_enqueue_scripts).
+            wp_localize_script('bokun-booking-scripts', 'BokunSkipCashConfig', $config);
+        }
+
+        // Fallback path: inline boot snippet in <head>, guaranteed to be printed
+        // even if the script handle was registered late or the page was cached.
+        wp_add_inline_script('bokun-booking-scripts', $this->build_config_bootstrap_js($config), 'before');
+    }
+
+    /**
+     * Idempotent JS that defines window.BokunSkipCashConfig if nothing else did.
+     */
+    private function build_config_bootstrap_js(array $config) {
+        return 'window.BokunSkipCashConfig = window.BokunSkipCashConfig || ' . wp_json_encode($config) . ';';
     }
 }
 
