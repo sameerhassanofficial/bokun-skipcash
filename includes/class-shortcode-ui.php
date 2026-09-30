@@ -53,7 +53,23 @@ class Bokun_SkipCash_Shortcode_UI {
             intval($act_details['bookingCutoff'] ?? 0);
 
         wp_enqueue_style('bokun-booking-styles');
-        wp_enqueue_script('bokun-booking-scripts', BOKUN_SKIPCASH_URL . 'assets/js/bokun-booking.js', array(), time(), false);
+        // Enqueue the SHARED registered handle (see enqueue_frontend_assets) instead of
+        // re-registering it with a new src + time() version here. Re-registering on every
+        // shortcode render replaced the script definition AFTER wp_localize_script had run,
+        // which stripped BokunSkipCashConfig from the output. The JS then posted to
+        // /reserve without the X-Bokun-Nonce header and the REST permission callback
+        // rejected it with "Security check failed. Please refresh the page and try again."
+        if (!wp_script_is('bokun-booking-scripts', 'registered')) {
+            wp_register_script('bokun-booking-scripts', BOKUN_SKIPCASH_URL . 'assets/js/bokun-booking.js', array(), BOKUN_SKIPCASH_VERSION, true);
+            wp_localize_script('bokun-booking-scripts', 'BokunSkipCashConfig', array(
+                'ajaxUrl'   => admin_url('admin-ajax.php'),
+                'restUrl'   => esc_url_raw(rest_url('bokun-skipcash/v1/')),
+                'nonce'     => wp_create_nonce('bokun_skipcash_booking_nonce'), // sent by JS as X-Bokun-Nonce on POST /reserve
+                'currency'  => get_option('bokun_skipcash_currency', 'QAR'),
+                'timeoutMin'=> defined('BOKUN_SKIPCASH_TIMEOUT_MINUTES') ? BOKUN_SKIPCASH_TIMEOUT_MINUTES : 30
+            ));
+        }
+        wp_enqueue_script('bokun-booking-scripts');
         
         ob_start();
         ?>
@@ -356,7 +372,6 @@ class Bokun_SkipCash_Shortcode_UI {
                             <div class="bk-ticket-bottom">
                                 <div class="bk-ticket-time-row" style="display: flex !important; align-items: center !important; gap: 10px !important; margin-bottom: 4px !important;">
                                     <span class="bk-ticket-time" id="bk-summary-time" style="font-size: 22px !important; font-weight: 800 !important; color: #800020 !important;">--:--</span>
-                                    <span class="bk-ticket-tag" id="bk-summary-tag" style="display:none; font-size: 11px !important; font-weight: 700 !important; border: 1px solid #f3cfd7 !important; background: #fff5f7 !important; color: #800020 !important; padding: 3px 8px !important; border-radius: 6px !important;">Sunrise</span>
                                 </div>
                                 <div class="bk-ticket-date" id="bk-summary-date" style="font-size: 14px !important; font-weight: 600 !important; color: #800020 !important; margin-bottom: 16px !important;">Select a date</div>
                                 <div class="bk-ticket-price-box" style="display: flex !important; justify-content: space-between !important; align-items: baseline !important; border-top: 1px solid #f1f5f9 !important; padding-top: 12px !important;">

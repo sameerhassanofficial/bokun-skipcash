@@ -231,7 +231,6 @@
                 sumTitle: container.querySelector('#bk-summary-event-title'),
                 sumAdults: container.querySelector('#bk-summary-adults'),
                 sumTime: container.querySelector('#bk-summary-time'),
-                sumTag: container.querySelector('#bk-summary-tag'),
                 sumDate: container.querySelector('#bk-summary-date'),
                 sumTotal: container.querySelector('#bk-summary-total'),
                 
@@ -742,16 +741,8 @@
                 
                 if (state.selectedTime) {
                     if (DOM.sumTime) DOM.sumTime.textContent = state.selectedTime.displayTimeLabel || state.selectedTime.startTime;
-                    if (DOM.sumTag) {
-                        DOM.sumTag.style.display = 'inline-block';
-                        const hr = parseInt(state.selectedTime.startTime.split(':')[0], 10);
-                        if (hr < 10) { DOM.sumTag.textContent = 'AM'; }
-                        else if (hr < 16) { DOM.sumTag.textContent = 'Morning'; }
-                        else { DOM.sumTag.textContent = 'PM'; }
-                    }
                 } else {
                     if (DOM.sumTime) DOM.sumTime.textContent = '--:--';
-                    if (DOM.sumTag) DOM.sumTag.style.display = 'none';
                 }
                 
                 var calculatedTotal = 0;
@@ -1660,11 +1651,22 @@ var isPastCutoff = function(s, dStr) {
                 
                 var url = buildEndpointUrl('reserve', '');
                 logDebug('Initiating Checkout Reserve: ' + url);
-                
+
+                // The /reserve REST endpoint enforces a valid WP nonce via the
+                // X-Bokun-Nonce header ( BokunSkipCashConfig.nonce from wp_localize_script ).
+                // Without it the permission callback rejects the request with
+                // "Security check failed. Please refresh the page and try again."
+                var bkNonce = (window.BokunSkipCashConfig && window.BokunSkipCashConfig.nonce) ? window.BokunSkipCashConfig.nonce : '';
+                if (!bkNonce) {
+                    logDebug('Booking nonce missing - BokunSkipCashConfig not loaded.', true);
+                }
+
                 fetch(url, {
                     method: 'POST',
+                    credentials: 'same-origin',
                     headers: {
-                        'Content-Type': 'application/json'
+                        'Content-Type': 'application/json',
+                        'X-Bokun-Nonce': bkNonce
                     },
                     body: JSON.stringify(payload)
                 })

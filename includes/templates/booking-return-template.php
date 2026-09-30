@@ -2,28 +2,31 @@
 if (!defined('ABSPATH')) {
     exit;
 }
-get_header();
 
-$status_id = isset($_GET['statusId']) ? intval($_GET['statusId']) : (isset($_GET['status']) && strtolower($_GET['status']) === 'paid' ? 2 : 0);
-$status_str = strtolower(sanitize_text_field($_GET['status'] ?? ''));
-$is_skipcash_paid = ($status_id === 2 || $status_str === 'paid' || !empty($_GET['transId']) || !empty($_GET['paymentId']) || !empty($_GET['id']));
+// The return page is rendered from handle_callback_redirect(), which defines the
+// $bokun_return_context BEFORE loading this template. get_header() must run after that
+// so the context variables are still in scope (globals set before get_header() can be
+// clobbered by theme header partials).
 
-$is_confirmed = ($record && ($record['status'] ?? '') === 'CONFIRMED') || $is_skipcash_paid;
+// Context provided by Bokun_SkipCash_Booking_Controller::handle_callback_redirect().
+$bokun_return_context = isset($bokun_return_context) && is_array($bokun_return_context) ? $bokun_return_context : array();
 
-if ($is_confirmed) {
-    if (!$record) {
-        $record = array(
-            'confirmationCode' => $code,
-            'activity_name'    => 'Tour Experience',
-            'amount'           => floatval($_GET['amount'] ?? 0),
-            'currency'         => get_option('bokun_skipcash_currency', 'QAR'),
-            'customer'         => array('firstName' => 'Valued', 'lastName' => 'Guest', 'email' => ''),
-        );
-    }
-    $record['status'] = 'CONFIRMED';
-    $record['confirmed_at'] = time();
-    // No transient cache
+$code          = $bokun_return_context['code'] ?? (isset($_GET['code']) ? sanitize_text_field(wp_unslash($_GET['code'])) : '');
+$record        = $bokun_return_context['record'] ?? null;
+$verify_token  = $bokun_return_context['verify_token'] ?? (isset($_GET['vtoken']) ? sanitize_text_field(wp_unslash($_GET['vtoken'])) : '');
+$verify_error  = $bokun_return_context['verify_error'] ?? '';
+
+// Confirmation is based ONLY on the server-side verified record status.
+// Client-supplied query params (statusId/status/transId/paymentId) are NOT trusted:
+// an attacker could otherwise craft a return URL that renders a fake "paid" page.
+$is_confirmed = !empty($record) && (($record['status'] ?? '') === 'CONFIRMED');
+
+if ($is_confirmed && empty($record['customer']['firstName'])) {
+    $record['customer'] = array_merge(array('firstName' => 'Valued', 'lastName' => 'Guest', 'email' => ''), (array)($record['customer'] ?? array()));
 }
+
+
+get_header();
 ?>
 <div class="wrap bokun-return-page" style="max-width: 650px; margin: 40px auto; padding: 32px; background: #ffffff; border-radius: 16px; box-shadow: 0 10px 30px rgba(0,0,0,0.06); font-family: 'Roboto'; border: 1px solid #e5e7eb;">
     <?php if ($is_confirmed): ?>
@@ -112,7 +115,9 @@ if ($is_confirmed) {
             var maxChecks = 15;
             var bookingCode = <?php echo wp_json_encode($code); ?>;
             var restBase = <?php echo wp_json_encode(esc_url_raw(rest_url('bokun-skipcash/v1/'))); ?>;
-            var verifyUrl = restBase + 'confirm-status?code=' + encodeURIComponent(bookingCode);
+            var bookingToken = <?php echo wp_json_encode($verify_token); ?>;
+            var verifyUrl = restBase + 'confirm-status?code=' + encodeURIComponent(bookingCode) + '&token=' + encodeURIComponent(bookingToken);
+            var verifyHeaders = { 'X-Bokun-Token': bookingToken };
 
             function isBookingConfirmed(data) {
                 if (!data) return false;
@@ -129,7 +134,7 @@ if ($is_confirmed) {
 
             function checkConfirmation() {
                 checkCount++;
-                fetch(verifyUrl, { cache: 'no-store' })
+                fetch(verifyUrl, { cache: 'no-store', credentials: 'same-origin', headers: verifyHeaders })
                 .then(function(res) { return res.json(); })
                 .then(function(data) {
                     if (isBookingConfirmed(data)) {
@@ -160,7 +165,7 @@ if ($is_confirmed) {
                     btn.disabled = true;
                     btn.innerText = 'Checking with Bókun...';
                 }
-                fetch(verifyUrl, { cache: 'no-store' })
+                fetch(verifyUrl, { cache: 'no-store', credentials: 'same-origin', headers: verifyHeaders })
                 .then(function(res) { return res.json(); })
                 .then(function(data) {
                     if (isBookingConfirmed(data)) {
