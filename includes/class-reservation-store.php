@@ -22,20 +22,37 @@ class Bokun_Reservation_Store {
 
     /**
      * Ensure the custom table exists (called from activation & plugins_loaded fallback).
+     *
+     * IMPORTANT: this runs both from the activation hook and from a plugins_loaded
+     * safety net. The plugins_loaded context does NOT have wp-admin loaded, so
+     * wp-admin/includes/upgrade.php (dbDelta) is not always available. Requiring it
+     * unconditionally caused a fatal "Failed opening required .../upgrade.php" error
+     * during activation/loading on some hosts. We therefore load it only when present
+     * and fall back to plain dbDelta()/raw CREATE TABLE.
      */
     public static function maybe_install() {
         global $wpdb;
 
-        $table_name = $wpdb->prefix . self::TABLE;
-        $version    = get_option('bokun_skipcash_db_version', '0');
-
-        if ($version === '1.0.0') {
+        if (!isset($wpdb) || !is_object($wpdb)) {
             return;
         }
 
-        require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+        $table_name = $wpdb->prefix . self::TABLE;
+        $version    = get_option('bokun_skipcash_db_version', '0');
 
-        $charset_collate = $wpdb->get_charset_collate();
+        if ($version === '1.0.0' && self::table_exists($table_name)) {
+            return;
+        }
+
+        // Load dbDelta only if the admin upgrade file actually exists on this request.
+        $upgrade_file = ABSPATH . 'wp-admin/includes/upgrade.php';
+        if (!$upgrade_file || !function_exists('dbDelta')) {
+            if (is_readable($upgrade_file)) {
+                require_once $upgrade_file;
+            }
+        }
+
+        $charset_collate = method_exists($wpdb, 'get_charset_collate') ? $wpdb->get_charset_collate() : '';
         $sql = "CREATE TABLE {$table_name} (
             id BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT,
             confirmation_code VARCHAR(64) NOT NULL,
@@ -57,8 +74,30 @@ class Bokun_Reservation_Store {
             KEY status (status)
         ) {$charset_collate};";
 
-        dbDelta($sql);
-        update_option('bokun_skipcash_db_version', '1.0.0');
+        if (function_exists('dbDelta')) {
+            dbDelta($sql);
+        } else {
+            // dbDelta unavailable (non-admin request on some hosts): create directly.
+            $wpdb->query($sql);
+        }
+
+        if (self::table_exists($table_name)) {
+            update_option('bokun_skipcash_db_version', '1.0.0');
+        } else {
+            error_log('[Bokun_Reservation_Store] Could not create table ' . $table_name . ': ' . $wpdb->last_error);
+        }
+    }
+
+    /**
+     * Whether a given table actually exists in the database.
+     */
+    public static function table_exists($table_name) {
+        global $wpdb;
+        if (!isset($wpdb) || !is_object($wpdb)) {
+            return false;
+        }
+        $found = $wpdb->get_var($wpdb->prepare("SHOW TABLES LIKE %s", $table_name));
+        return $found === $table_name;
     }
 
     private function table() {

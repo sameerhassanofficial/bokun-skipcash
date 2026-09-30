@@ -117,14 +117,38 @@ define('BOKUN_SKIPCASH_PATH', plugin_dir_path(__FILE__));
 define('BOKUN_SKIPCASH_URL', plugin_dir_url(__FILE__));
 define('BOKUN_SKIPCASH_TIMEOUT_MINUTES', 30);
 
-// Require core classes
-require_once BOKUN_SKIPCASH_PATH . 'includes/class-bokun-api.php';
-require_once BOKUN_SKIPCASH_PATH . 'includes/class-skipcash-api.php';
-require_once BOKUN_SKIPCASH_PATH . 'includes/class-reservation-store.php';
-require_once BOKUN_SKIPCASH_PATH . 'includes/class-rate-limiter.php';
-require_once BOKUN_SKIPCASH_PATH . 'includes/class-booking-controller.php';
-require_once BOKUN_SKIPCASH_PATH . 'includes/class-admin-settings.php';
-require_once BOKUN_SKIPCASH_PATH . 'includes/class-shortcode-ui.php';
+// Require core classes.
+// Each include is guarded so that a single missing/unreadable file produces a
+// clear admin notice instead of a fatal "Failed opening required ..." error that
+// white-screens the whole site on activation.
+$GLOBALS['bokun_skipcash_missing_includes'] = array();
+$bokun_skipcash_includes = array(
+    'includes/class-bokun-api.php',
+    'includes/class-skipcash-api.php',
+    'includes/class-reservation-store.php',
+    'includes/class-rate-limiter.php',
+    'includes/class-booking-controller.php',
+    'includes/class-admin-settings.php',
+    'includes/class-shortcode-ui.php',
+);
+foreach ($bokun_skipcash_includes as $bokun_skipcash_include) {
+    $bokun_skipcash_file = BOKUN_SKIPCASH_PATH . $bokun_skipcash_include;
+    if (is_readable($bokun_skipcash_file)) {
+        require_once $bokun_skipcash_file;
+    } else {
+        $GLOBALS['bokun_skipcash_missing_includes'][] = $bokun_skipcash_include;
+    }
+}
+
+if (!empty($GLOBALS['bokun_skipcash_missing_includes'])) {
+    add_action('admin_notices', function () {
+        printf(
+            '<div class="notice notice-error"><p><strong>Bókun &amp; SkipCash Booking Gateway:</strong> could not load %s. Reactivate or reinstall the plugin.</p></div>',
+            esc_html(implode(', ', $GLOBALS['bokun_skipcash_missing_includes']))
+        );
+    });
+    return; // Abort bootstrap: nothing can run safely without its classes.
+}
 
 /**
  * Main Singleton Class
@@ -200,12 +224,30 @@ class Bokun_SkipCash_Plugin {
     }
 }
 
-// Initialize on plugins_loaded
-add_action('plugins_loaded', array('Bokun_SkipCash_Plugin', 'get_instance'));
+// Initialize on plugins_loaded — but only when every required class is present.
+// Without this guard a partial deploy triggers
+// "Fatal error: Uncaught Error: Class 'Bokun_API' not found" during activation.
+add_action('plugins_loaded', function () {
+    $required = array('Bokun_API', 'SkipCash_API', 'Bokun_Reservation_Store', 'Bokun_Rate_Limiter', 'Bokun_SkipCash_Plugin');
+    foreach ($required as $class) {
+        if (!class_exists($class)) {
+            add_action('admin_notices', function () use ($class) {
+                printf(
+                    '<div class="notice notice-error"><p><strong>Bókun &amp; SkipCash Booking Gateway:</strong> missing class <code>%s</code>. The plugin is inactive until the files are restored.</p></div>',
+                    esc_html($class)
+                );
+            });
+            return;
+        }
+    }
+    Bokun_SkipCash_Plugin::get_instance();
+});
 
 // Activation Hook
 register_activation_hook(__FILE__, function () {
-    Bokun_Reservation_Store::maybe_install();
+    if (class_exists('Bokun_Reservation_Store')) {
+        Bokun_Reservation_Store::maybe_install();
+    }
     if (!get_option('bokun_skipcash_currency')) {
         update_option('bokun_skipcash_currency', 'QAR');
     }
