@@ -90,7 +90,14 @@ class SkipCash_API {
 
         // Body includes signed fields plus unsigned ReturnUrl/WebhookUrl
         $body = $fields_to_sign;
-        $body['ReturnUrl']  = $params['return_url'];
+        // Append our own return markers to the ReturnUrl so they survive even if
+        // SkipCash appends its query params with a fragment separator (#) instead
+        // of "?&" — in that case the markers land in the query string portion and
+        // stay visible to $_GET on the return page. Without bokun_return the return
+        // handler never runs and customers get stuck on "Finalizing Booking...".
+        $return_url = esc_url_raw($params['return_url']);
+        $return_url .= (strpos($return_url, '?') === false ? '?' : '&') . 'bokun_return=1';
+        $body['ReturnUrl']  = $return_url;
         $body['WebhookUrl'] = $params['webhook_url'];
 
         $response = wp_remote_post($url, array(
