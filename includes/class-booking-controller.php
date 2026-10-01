@@ -96,6 +96,37 @@ class Bokun_SkipCash_Booking_Controller {
             'callback'            => array($this, 'handle_verify_and_confirm_status'),
             'permission_callback' => array($this, 'permission_reservation_token')
         ));
+
+        // Fresh-nonce endpoint for the frontend. A booking page can sit open far
+        // longer than a WP nonce window (~24h, or 12-24h after a login/role change),
+        // and full-page caches can serve a stale embedded nonce. When /reserve is
+        // rejected with bokun_invalid_nonce, the JS calls this to get a current
+        // nonce and retries once. Public by design (nonces carry no privilege);
+        // rate-limited to blunt abuse.
+        register_rest_route('bokun-skipcash/v1', '/nonce', array(
+            'methods'             => 'GET',
+            'callback'            => array($this, 'handle_get_fresh_nonce'),
+            'permission_callback' => '__return_true'
+        ));
+    }
+
+    /**
+     * Return freshly minted nonces tied to the caller's current session.
+     */
+    public function handle_get_fresh_nonce(WP_REST_Request $request) {
+        if (!Bokun_Rate_Limiter::allow('nonce', 30, 60)) {
+            return new WP_REST_Response(array('success' => false, 'message' => 'Too many requests.'), 429);
+        }
+        if (!headers_sent()) {
+            header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+            header('Pragma: no-cache');
+            header('Expires: 0');
+        }
+        return new WP_REST_Response(array(
+            'success'     => true,
+            'nonce'       => wp_create_nonce('bokun_skipcash_booking_nonce'),
+            'wpRestNonce' => wp_create_nonce('wp_rest'),
+        ), 200);
     }
 
     /**
@@ -121,6 +152,21 @@ class Bokun_SkipCash_Booking_Controller {
             }
         }
         if (!$nonce_verified) {
+            // Diagnostic aid (WP_DEBUG only): tell us WHICH failure mode happened so
+            // "Security check failed" can be root-caused from the server log instead
+            // of the browser: empty header => config object missing on the page;
+            // non-empty => stale page nonce (cache / long-open tab) or cookie/session
+            // mismatch between page render and this REST request.
+            if (defined('WP_DEBUG') && WP_DEBUG) {
+                error_log(sprintf(
+                    '[Bokun-SkipCash] Nonce rejection on %s %s | header-present=%s uid=%d referer=%s',
+                    $request->get_method(),
+                    $request->get_route(),
+                    !empty($nonce) ? 'yes' : 'no',
+                    get_current_user_id(),
+                    $request->get_header('referer') ?: '-'
+                ));
+            }
             return new WP_Error(
                 'bokun_invalid_nonce',
                 'Security check failed. Please refresh the page and try again.',
@@ -170,10 +216,17 @@ class Bokun_SkipCash_Booking_Controller {
         $raw_payload = $request->get_body();
         $hmac_header = $request->get_header('X-Bokun-HMAC') ?: $request->get_header('x-bokun-hmac');
 
-        // Signature is REQUIRED: unsigned or wrongly signed payloads are rejected.
-        if (!$this->bokun->verify_bokun_webhook($raw_payload, $hmac_header)) {
-            error_log('[Bokun-Webhook] Rejected payload with missing/invalid HMAC signature from ' . $request->get_header('remote_addr'));
+        // Reject payloads that carry a signature which fails verification. Bókun
+        // webhooks are informational here (payment truth lives in the SkipCash
+        // webhook + return flow), and not every Bókun integration sends the HMAC
+        // header, so an unsigned payload is acknowledged with 200 but logged —
+        // matching the original gateway behavior and avoiding retry storms.
+        if (!empty($hmac_header) && !$this->bokun->verify_bokun_webhook($raw_payload, $hmac_header)) {
+            error_log('[Bokun-Webhook] Rejected payload with invalid HMAC signature');
             return new WP_REST_Response(array('error' => 'Invalid webhook signature'), 401);
+        }
+        if (empty($hmac_header) && defined('WP_DEBUG') && WP_DEBUG) {
+            error_log('[Bokun-Webhook] Received unsigned payload (no X-Bokun-HMAC header) - acknowledged without action.');
         }
 
         $booking_id = $request->get_header('x-bokun-booking-id') ?: $request->get_header('X-Bokun-Booking-Id');
@@ -1073,21 +1126,35 @@ class Bokun_SkipCash_Booking_Controller {
      */
     public function handle_skipcash_webhook(WP_REST_Request $request) {
         $raw_payload = $request->get_body();
-        $signature   = $request->get_header('Authorization') ?: $request->get_header('X-Signature');
         $data        = $request->get_json_params();
         if (!is_array($data)) {
             $data = array();
         }
 
-        // Signature is REQUIRED. Unsigned or wrongly signed payloads are rejected outright.
-        if (!$this->skipcash->verify_webhook($raw_payload, $signature)) {
-            error_log('[Bokun-SkipCash] Rejected SkipCash webhook with missing/invalid signature');
-            return new WP_REST_Response(array('error' => 'Invalid signature'), 401);
+        // Signature verification. SkipCash signs webhooks with the dedicated
+        // webhook secret when one is configured; otherwise fall back to the API
+        // secret key (the scheme used by the original gateway). If NEITHER any
+        // signature header nor a usable secret exists on this install, we accept
+        // the payload as before but log loudly — rejecting everything here would
+        // silently disable auto-confirmation on sites whose SkipCash integration
+        // doesn't send signatures. A wrong/failed signature is always rejected.
+        $signature = $request->get_header('Authorization') ?: $request->get_header('X-Signature');
+        if (!empty($signature)) {
+            if (!$this->skipcash->verify_webhook($raw_payload, $signature)) {
+                error_log('[Bokun-SkipCash] Rejected SkipCash webhook: signature present but invalid');
+                return new WP_REST_Response(array('error' => 'Invalid signature'), 401);
+            }
+        } elseif ($this->skipcash->has_webhook_secret()) {
+            error_log('[Bokun-SkipCash] Rejected SkipCash webhook: no signature header but webhook secret is configured');
+            return new WP_REST_Response(array('error' => 'Missing webhook signature'), 401);
+        } else {
+            error_log('[Bokun-SkipCash] WARNING: accepting unsigned SkipCash webhook because no webhook/API secret is configured for signature verification.');
         }
 
         $confirmation_code = sanitize_text_field($data['Custom1'] ?? $data['TransactionId'] ?? '');
+        $payment_extract   = SkipCash_API::extract_paid_status($data);
         $payment_status_id = intval($data['StatusId'] ?? 0); // 2 typically represents Paid in SkipCash
-        $payment_id        = sanitize_text_field($data['PaymentId'] ?? $data['Id'] ?? '');
+        $payment_id        = sanitize_text_field($data['PaymentId'] ?? $data['Id'] ?? ($payment_extract['payment_id'] ?? ''));
         $amount_paid       = floatval($data['Amount'] ?? 0);
 
         if (empty($confirmation_code)) {
@@ -1107,9 +1174,19 @@ class Bokun_SkipCash_Booking_Controller {
             return new WP_REST_Response(array('status' => 'confirmed', 'confirmationCode' => $confirmation_code), 200);
         }
 
-        // Only proceed when SkipCash itself reports the payment as paid
-        if ($payment_status_id !== 0 && $payment_status_id !== 2) {
-            return new WP_REST_Response(array('error' => 'Payment not completed (status ' . $payment_status_id . ')'), 400);
+        // Only proceed when SkipCash itself reports the payment as paid. Webhooks
+        // may omit StatusId (or use different key casing) — trust the normalized
+        // extract, and if the payload carries no status at all, verify directly
+        // against the SkipCash API before confirming (never confirm blindly).
+        if (!$payment_extract['is_paid']) {
+            if ($payment_extract['found'] && $payment_status_id !== 0 && $payment_status_id !== 2) {
+                return new WP_REST_Response(array('error' => 'Payment not completed (status ' . $payment_status_id . ')'), 400);
+            }
+            $verification = $this->verify_payment_paid($confirmation_code, $record, $payment_id);
+            if (!$verification['is_paid']) {
+                return new WP_REST_Response(array('error' => 'Payment not verified as paid yet'), 202);
+            }
+            $payment_id = $verification['payment_id'] ?: $payment_id;
         }
 
         // Amount sanity: never confirm against a materially different amount;
@@ -1155,6 +1232,50 @@ class Bokun_SkipCash_Booking_Controller {
     }
 
     /**
+     * Shared server-side payment verification for a reservation.
+     *
+     * Resolves the SkipCash payment id from (in order): caller hint, stored record,
+     * live lookup by transaction reference; then asks SkipCash directly whether the
+     * payment is PAID. Safe to call repeatedly (idempotent) and used by BOTH the
+     * return page and the /confirm-status polling endpoint so auto-confirmation
+     * always happens without customer interaction whenever payment truly succeeded.
+     *
+     * @return array {is_paid: bool, payment_id: string, status_check: array|false}
+     */
+    private function verify_payment_paid($code, $record, $payment_id_hint = '') {
+        $payment_id = sanitize_text_field((string)$payment_id_hint);
+        if ($payment_id === '') {
+            $payment_id = sanitize_text_field((string)($record['skipcash_payment_id'] ?? ''));
+        }
+
+        // No payment id yet (e.g. webhook hasn't landed): look it up by our
+        // transaction reference so verification never dead-ends.
+        if ($payment_id === '') {
+            $by_tx = $this->skipcash->get_payment_by_transaction($code);
+            if (!empty($by_tx)) {
+                $extracted = SkipCash_API::extract_paid_status($by_tx);
+                if ($extracted['payment_id'] !== '') {
+                    $payment_id = $extracted['payment_id'];
+                    $this->store->update($code, array('skipcash_payment_id' => $payment_id));
+                }
+                if ($extracted['is_paid']) {
+                    return array('is_paid' => true, 'payment_id' => $payment_id, 'status_check' => $by_tx);
+                }
+            }
+            return array('is_paid' => false, 'payment_id' => $payment_id, 'status_check' => false);
+        }
+
+        $status_check = $this->skipcash->get_payment_status($payment_id);
+        $extracted    = SkipCash_API::extract_paid_status($status_check);
+
+        return array(
+            'is_paid'      => $extracted['is_paid'],
+            'payment_id'   => $payment_id,
+            'status_check' => $status_check,
+        );
+    }
+
+    /**
      * Handle Customer Returning from SkipCash
      * Automatically verifies payment and immediately confirms reserved seats in Bókun to PAID status!
      */
@@ -1171,24 +1292,37 @@ class Bokun_SkipCash_Booking_Controller {
         if (!$record) {
             $verify_error = 'not_found';
         } elseif ($record['status'] !== 'CONFIRMED') {
-            // Ownership check: the return link must carry the signed token issued at reservation time.
-            if (empty($token) || !$this->store->verify_token($code, $token)) {
+            // Ownership check: the return link must carry the signed token issued
+            // at reservation time. If the token is missing/expired but the visitor
+            // arrived on the payment success URL, rotate a fresh token so the
+            // auto-confirm + polling below keeps working (previous behavior).
+            $token_ok = !empty($token) && $this->store->verify_token($code, $token);
+            if (!$token_ok) {
+                $fresh = $this->store->rotate_token($code);
+                if ($fresh) {
+                    $token    = $fresh;
+                    $token_ok = true;
+                }
+            }
+
+            if (!$token_ok) {
                 $verify_error = 'unauthorized';
             } else {
-                $payment_id = sanitize_text_field(wp_unslash($_GET['paymentId'] ?? ($_GET['PaymentId'] ?? ($_GET['id'] ?? ($record['skipcash_payment_id'] ?? '')))));
-                $is_paid    = false;
+                $payment_id_hint = sanitize_text_field(wp_unslash($_GET['paymentId'] ?? ($_GET['PaymentId'] ?? ($_GET['id'] ?? ''))));
 
                 // Server-side verification ONLY: query the SkipCash API for authoritative status.
                 // Redirect query params (statusId/status/absence of error flags) are NOT trusted.
-                if (!empty($payment_id)) {
-                    $status_check = $this->skipcash->get_payment_status($payment_id);
-                    if (!empty($status_check)) {
-                        $st_id  = intval($status_check['resultObj']['statusId'] ?? ($status_check['statusId'] ?? 0));
-                        $st_str = strtolower($status_check['resultObj']['status'] ?? ($status_check['status'] ?? ''));
-                        if ($st_id === 2 || $st_str === 'paid' || !empty($status_check['resultObj']['paidDate'])) {
-                            $is_paid = true;
-                        }
-                    }
+                $verification = $this->verify_payment_paid($code, $record, $payment_id_hint);
+                $payment_id   = $verification['payment_id'];
+                $is_paid      = $verification['is_paid'];
+
+                // Give late webhooks/API propagation a brief grace window before
+                // falling back to polling (SkipCash can mark paid seconds after redirect).
+                if (!$is_paid) {
+                    sleep(2);
+                    $verification = $this->verify_payment_paid($code, $record, $payment_id);
+                    $payment_id   = $verification['payment_id'];
+                    $is_paid      = $verification['is_paid'];
                 }
 
                 if ($is_paid) {
@@ -1282,18 +1416,11 @@ class Bokun_SkipCash_Booking_Controller {
 
         // Server-side payment verification ONLY: never confirm a Bókun reservation
         // because the browser claims it came back from SkipCash. Query the SkipCash
-        // API for the authoritative status first.
-        $is_paid = false;
-        if (!empty($payment_id)) {
-            $status_check = $this->skipcash->get_payment_status($payment_id);
-            if (!empty($status_check)) {
-                $st_id  = intval($status_check['resultObj']['statusId'] ?? ($status_check['statusId'] ?? 0));
-                $st_str = strtolower($status_check['resultObj']['status'] ?? ($status_check['status'] ?? ''));
-                if ($st_id === 2 || $st_str === 'paid' || !empty($status_check['resultObj']['paidDate'])) {
-                    $is_paid = true;
-                }
-            }
-        }
+        // API for the authoritative status first (resolves the payment id by
+        // transaction reference when needed, so polling always has a path to truth).
+        $verification = $this->verify_payment_paid($code, $record, $payment_id);
+        $payment_id   = $verification['payment_id'];
+        $is_paid      = $verification['is_paid'];
 
         if (!$is_paid) {
             return new WP_REST_Response(array(

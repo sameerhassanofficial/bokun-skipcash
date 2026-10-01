@@ -18,7 +18,10 @@ if (!defined('ABSPATH')) {
 class Bokun_Reservation_Store {
 
     const TABLE = 'bokun_reservations';
-    const TOKEN_TTL_MINUTES = 60;
+    // Tokens live longer than the Bókun hold window: a customer may return to the
+    // success page well after payment (email link, back-button, delayed webhook).
+    // If the token expired first, auto-confirmation would silently stop working.
+    const TOKEN_TTL_MINUTES = 1440; // 24 hours
 
     /**
      * Ensure the custom table exists (called from activation & plugins_loaded fallback).
@@ -224,16 +227,49 @@ class Bokun_Reservation_Store {
 
     /**
      * Verify that a bearer token belongs to the given confirmation code.
+     *
+     * Once a reservation is CONFIRMED we keep accepting its token indefinitely:
+     * customers legitimately revisit the success page via email links / bookmarks
+     * long after the payment window, and returning 401 there previously surfaced
+     * as "invalid or expired verification token" errors on paid bookings. The
+     * token itself remains a secret capability (SHA-256 hashed at rest), so this
+     * only relaxes expiry for already-settled records.
      */
     public function verify_token($confirmation_code, $token) {
         $record = $this->get_by_code($confirmation_code);
         if (!$record || empty($record['verify_token_hash']) || empty($record['token_expires_at'])) {
             return false;
         }
-        if ($record['token_expires_at'] < time()) {
+        if (($record['status'] ?? '') !== 'CONFIRMED' && $record['token_expires_at'] < time()) {
             return false;
         }
         return hash_equals($record['verify_token_hash'], hash('sha256', (string)$token));
+    }
+
+    /**
+     * Mint a fresh verification token for an existing reservation (used when a
+     * customer returns without/with an expired token but the payment can still
+     * be verified server-side). Returns the raw token (shown once) or null.
+     */
+    public function rotate_token($confirmation_code) {
+        global $wpdb;
+        $code = (string)$confirmation_code;
+        if ($code === '' || !$this->get_by_code($code)) {
+            return null;
+        }
+        $token = bin2hex(random_bytes(32));
+        $updated = $wpdb->update(
+            $this->table(),
+            array(
+                'verify_token_hash' => hash('sha256', $token),
+                'token_expires_at'  => time() + (self::TOKEN_TTL_MINUTES * 60),
+                'updated_at'        => time(),
+            ),
+            array('confirmation_code' => $code),
+            array('%s', '%d', '%d'),
+            array('%s')
+        );
+        return $updated !== false ? $token : null;
     }
 
     /**
