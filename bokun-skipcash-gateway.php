@@ -111,7 +111,7 @@ if (!defined('ABSPATH')) {
     exit; // Prevent direct access
 }
 
-define('BOKUN_SKIPCASH_VERSION', '2.8.1');
+define('BOKUN_SKIPCASH_VERSION', '2.8.2');
 define('BOKUN_SKIPCASH_FILE', __FILE__);
 define('BOKUN_SKIPCASH_PATH', plugin_dir_path(__FILE__));
 define('BOKUN_SKIPCASH_URL', plugin_dir_url(__FILE__));

@@ -1248,25 +1248,34 @@ class Bokun_SkipCash_Booking_Controller {
             $payment_id = sanitize_text_field((string)($record['skipcash_payment_id'] ?? ''));
         }
 
-        // No payment id yet (e.g. webhook hasn't landed): look it up by our
-        // transaction reference so verification never dead-ends.
-        if ($payment_id === '') {
+        $status_check = false;
+        if ($payment_id !== '') {
+            $status_check = $this->skipcash->get_payment_status($payment_id);
+        }
+        $extracted = SkipCash_API::extract_paid_status($status_check);
+
+        // Fallback lookup: the redirect/webhook may not have carried a usable
+        // payment id, or the direct status endpoint may not support this merchant's
+        // response shape. Query payments by our transaction reference (the Bókun
+        // confirmation code) — this previously dead-ended and left bookings stuck
+        // on "Finalizing..." instead of auto-confirming.
+        if (!$extracted['is_paid']) {
             $by_tx = $this->skipcash->get_payment_by_transaction($code);
             if (!empty($by_tx)) {
-                $extracted = SkipCash_API::extract_paid_status($by_tx);
-                if ($extracted['payment_id'] !== '') {
-                    $payment_id = $extracted['payment_id'];
+                $tx_extracted = SkipCash_API::extract_paid_status($by_tx);
+                if ($tx_extracted['payment_id'] !== '') {
+                    $payment_id = $tx_extracted['payment_id'];
                     $this->store->update($code, array('skipcash_payment_id' => $payment_id));
                 }
-                if ($extracted['is_paid']) {
+                if ($tx_extracted['is_paid']) {
                     return array('is_paid' => true, 'payment_id' => $payment_id, 'status_check' => $by_tx);
                 }
+                if ($extracted !== $tx_extracted && $extracted['found'] && !$tx_extracted['found']) {
+                    // Keep whichever lookup actually returned a recognizable record.
+                    return array('is_paid' => false, 'payment_id' => $payment_id, 'status_check' => $status_check);
+                }
             }
-            return array('is_paid' => false, 'payment_id' => $payment_id, 'status_check' => false);
         }
-
-        $status_check = $this->skipcash->get_payment_status($payment_id);
-        $extracted    = SkipCash_API::extract_paid_status($status_check);
 
         return array(
             'is_paid'      => $extracted['is_paid'],
@@ -1365,6 +1374,15 @@ class Bokun_SkipCash_Booking_Controller {
                 // Payment could not be verified server-side; do NOT confirm the booking.
                 $verify_error = 'unverified';
             }
+            }
+
+            // Re-read the durable record so the template renders the final state
+            // immediately (shows "Booking Confirmed!" without waiting for a poll/reload).
+            if (($record['status'] ?? '') === 'CONFIRMED') {
+                $fresh_record = $this->store->get_by_code($code);
+                if ($fresh_record) {
+                    $record = $fresh_record;
+                }
             }
         }
 
