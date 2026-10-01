@@ -3,7 +3,7 @@
  * Plugin Name:       Bókun & SkipCash Booking Gateway
  * Plugin URI:        https://github.com/your-org/bokun-skipcash-gateway
  * Description:       Integrates Bókun Tour Booking API with SkipCash Qatar payment gateway via the RESERVE_FOR_EXTERNAL_PAYMENT flow, replacing the incompatible Bókun widget.
- * Version:           2.8.1
+ * Version:           2.8.3
  * Requires at least: 5.8
  * Requires PHP:      7.4
  * Author:            Tour Operations Team
@@ -111,7 +111,7 @@ if (!defined('ABSPATH')) {
     exit; // Prevent direct access
 }
 
-define('BOKUN_SKIPCASH_VERSION', '2.8.2');
+define('BOKUN_SKIPCASH_VERSION', '2.8.3');
 define('BOKUN_SKIPCASH_FILE', __FILE__);
 define('BOKUN_SKIPCASH_PATH', plugin_dir_path(__FILE__));
 define('BOKUN_SKIPCASH_URL', plugin_dir_url(__FILE__));

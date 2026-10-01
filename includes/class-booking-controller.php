@@ -1289,7 +1289,18 @@ class Bokun_SkipCash_Booking_Controller {
      * Automatically verifies payment and immediately confirms reserved seats in Bókun to PAID status!
      */
     public function handle_callback_redirect() {
-        if (!isset($_GET['bokun_return']) || empty($_GET['code'])) {
+        // Robust trigger detection: some hosts/proxies strip query args from the
+        // WP home URL, and some payment pages carry their state in the URL
+        // fragment. Detect our markers anywhere in REQUEST_URI as a fallback so
+        // the auto-confirm flow NEVER silently fails to run.
+        $is_return = isset($_GET['bokun_return']);
+        if (!$is_return) {
+            $uri = isset($_SERVER['REQUEST_URI']) ? (string) wp_unslash($_SERVER['REQUEST_URI']) : '';
+            if ($uri !== '' && (strpos($uri, 'bokun_return') !== false || strpos($uri, 'vtoken=') !== false)) {
+                $is_return = true;
+            }
+        }
+        if (!$is_return || empty($_GET['code'])) {
             return;
         }
 
@@ -1335,6 +1346,12 @@ class Bokun_SkipCash_Booking_Controller {
                 }
 
                 if ($is_paid) {
+                // Keep the durable record's payment id current BEFORE confirming,
+                // so webhook / polling paths never re-verify against a stale id.
+                if (!empty($payment_id)) {
+                    $this->store->update($code, array('skipcash_payment_id' => (string)$payment_id));
+                }
+
                 $tx_details = array(
                     'transactionDate' => gmdate('Y-m-d H:i:s'),
                     'transactionId'   => $payment_id ?: ('SKIPCASH-' . time()),

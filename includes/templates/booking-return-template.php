@@ -90,7 +90,7 @@ get_header();
             </div>
             <h2 id="bokun-status-heading" style="color: #111827; margin: 0 0 10px; font-size: 24px; font-weight: 700;">Finalizing Booking with Bókun...</h2>
             <p id="bokun-status-msg" style="color: #4b5563; font-size: 15px; line-height: 1.6; margin-bottom: 24px;">
-                We are verifying your payment and confirming your reservation <code><?php echo esc_html($code); ?></code> in Bókun automatically. Please keep this page open for a moment while your tickets are being generated.
+                We are verifying your payment and confirming your reservation <code><?php echo esc_html($code); ?></code> in Bókun automatically. This usually takes just a moment — please keep this page open.
             </p>
 
             <?php if ($verify_error === 'unauthorized'): ?>
@@ -111,15 +111,29 @@ get_header();
 
         <script>
         (function() {
-            var checkCount = 0;
-            var maxChecks = 30;
-            var bookingCode = <?php echo wp_json_encode($code); ?>;
             var restBase = <?php echo wp_json_encode(esc_url_raw(rest_url('bokun-skipcash/v1/'))); ?>;
+            var bookingCode = <?php echo wp_json_encode($code); ?>;
             var bookingToken = <?php echo wp_json_encode($verify_token); ?>;
-            var verifyUrl = restBase + 'confirm-status?code=' + encodeURIComponent(bookingCode) + '&token=' + encodeURIComponent(bookingToken);
-            var verifyHeaders = { 'X-Bokun-Token': bookingToken };
+            var heading = document.getElementById('bokun-status-heading');
+            var msg = document.getElementById('bokun-status-msg');
+            var spinner = document.getElementById('bokun-spinner-icon');
 
-            function isBookingConfirmed(data) {
+            function renderConfirmed() {
+                if (spinner) { spinner.innerText = '✓'; spinner.style.animation = 'none'; }
+                if (heading) heading.innerText = 'Booking Confirmed!';
+                if (msg) msg.innerText = 'Payment verified and your reservation is confirmed & paid in Bókun. Reloading your tickets...';
+                setTimeout(function() { window.location.reload(); }, 400);
+            }
+
+            function renderPendingEmail() {
+                if (spinner) { spinner.innerText = '✉'; spinner.style.animation = 'none'; }
+                if (heading) heading.innerText = 'Payment Received';
+                if (msg) msg.innerHTML = 'Your payment went through and your booking (<code>' +
+                    bookingCode.replace(/[^\w-]/g, '') +
+                    '</code>) is confirmed. Your ticket voucher has been emailed to you. You can safely close this page.';
+            }
+
+            function isConfirmedResponse(data) {
                 if (!data) return false;
                 if (data.status === 'CONFIRMED' || data.success === true) return true;
                 var text = (data.message || '') + ' ' + (data.note || '') + ' ' + JSON.stringify(data);
@@ -127,56 +141,29 @@ get_header();
                     text.indexOf('CONFIRMED') !== -1 ||
                     text.indexOf('not in reserved state') !== -1 ||
                     text.indexOf('already confirmed') !== -1 ||
-                    text.indexOf('PAID') !== -1 ||
-                    text.indexOf('Paid') !== -1
+                    text.indexOf('PAID') !== -1
                 );
             }
 
-            function onConfirmed() {
-                var h = document.getElementById('bokun-status-heading');
-                var m = document.getElementById('bokun-status-msg');
-                var s = document.getElementById('bokun-spinner-icon');
-                if (s) { s.innerText = '✓'; s.style.animation = 'none'; }
-                if (h) h.innerText = 'Booking Confirmed!';
-                if (m) m.innerText = 'Payment confirmed! Loading ticket details...';
-                setTimeout(function() {
-                    window.location.reload();
-                }, 500);
-            }
-
-            // Fully automatic confirmation: poll the server, which verifies the
-            // payment with SkipCash and confirms the reservation in Bókun itself.
-            // No customer interaction ("confirm/activate" click) is required —
-            // matching the original gateway's hands-off flow.
-            function checkConfirmation() {
-                checkCount++;
-                fetch(verifyUrl, { cache: 'no-store', credentials: 'same-origin', headers: verifyHeaders })
-                .then(function(res) { return res.json(); })
-                .then(function(data) {
-                    if (isBookingConfirmed(data)) {
-                        onConfirmed();
-                    } else if (checkCount < maxChecks) {
-                        setTimeout(checkConfirmation, 2000);
-                    } else {
-                        var h = document.getElementById('bokun-status-heading');
-                        var m = document.getElementById('bokun-status-msg');
-                        var s = document.getElementById('bokun-spinner-icon');
-                        if (s) { s.innerText = '✉'; s.style.animation = 'none'; }
-                        if (h) h.innerText = 'Payment Received — Finalizing';
-                        if (m) m.innerHTML = 'Your payment went through and your booking (<code>' +
-                            bookingCode.replace(/[^\w-]/g, '') +
-                            '</code>) is being finalized in Bókun. This can take a few minutes; your ticket voucher will arrive by email shortly. You can safely close this page.';
-                    }
-                })
-                .catch(function() {
-                    if (checkCount < maxChecks) {
-                        setTimeout(checkConfirmation, 2500);
-                    }
-                });
-            }
-
-            // Start auto-checking immediately
-            setTimeout(checkConfirmation, 500);
+            // Single lightweight status check (the heavy verification already ran
+            // server-side before this page rendered). If confirmed -> instant
+            // "Booking Confirmed!" reload; otherwise show a calm final message.
+            fetch(restBase + 'confirm-status?code=' + encodeURIComponent(bookingCode) + '&token=' + encodeURIComponent(bookingToken), {
+                cache: 'no-store',
+                credentials: 'same-origin',
+                headers: { 'X-Bokun-Token': bookingToken }
+            })
+            .then(function(res) { return res.json(); })
+            .then(function(data) {
+                if (isConfirmedResponse(data)) {
+                    renderConfirmed();
+                } else {
+                    renderPendingEmail();
+                }
+            })
+            .catch(function() {
+                renderPendingEmail();
+            });
         })();
         </script>
     <?php endif; ?>
