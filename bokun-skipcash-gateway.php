@@ -3,7 +3,7 @@
  * Plugin Name:       Bókun & SkipCash Booking Gateway
  * Plugin URI:        https://github.com/your-org/bokun-skipcash-gateway
  * Description:       Integrates Bókun Tour Booking API with SkipCash Qatar payment gateway via the RESERVE_FOR_EXTERNAL_PAYMENT flow, replacing the incompatible Bókun widget.
- * Version:           2.8.0
+ * Version:           2.8.1
  * Requires at least: 5.8
  * Requires PHP:      7.4
  * Author:            Tour Operations Team
@@ -111,7 +111,7 @@ if (!defined('ABSPATH')) {
     exit; // Prevent direct access
 }
 
-define('BOKUN_SKIPCASH_VERSION', '2.8.0');
+define('BOKUN_SKIPCASH_VERSION', '2.8.1');
 define('BOKUN_SKIPCASH_FILE', __FILE__);
 define('BOKUN_SKIPCASH_PATH', plugin_dir_path(__FILE__));
 define('BOKUN_SKIPCASH_URL', plugin_dir_url(__FILE__));
@@ -174,6 +174,11 @@ class Bokun_SkipCash_Plugin {
         $this->init_components();
         add_action('init', array($this, 'init_plugin'));
         add_action('wp_enqueue_scripts', array($this, 'enqueue_frontend_assets'));
+        // Cache-safe config bootstrap in <head> (placeholder nonces only — see
+        // print_config_bootstrap) and no-store headers on booking pages so
+        // full-page caches cannot serve stale embedded nonces.
+        add_action('wp_head', array($this, 'print_config_bootstrap'), 1);
+        add_action('template_redirect', array($this, 'protect_html_from_caching'));
         // Safety net: ensure table exists even if activation hook did not fire (e.g. dropped in).
         add_action('plugins_loaded', array('Bokun_Reservation_Store', 'maybe_install'), 20);
         // Housekeeping for expired holds.
@@ -233,36 +238,84 @@ class Bokun_SkipCash_Plugin {
      * first wins and the later one is a no-op guard (`window.X = window.X || {...}`).
      */
     public function localize_booking_config() {
-        static $printed = false;
-
-        $config = array(
-            'ajaxUrl'    => admin_url('admin-ajax.php'),
-            'restUrl'    => esc_url_raw(rest_url('bokun-skipcash/v1/')),
-            // Fresh nonce per request, valid ~24h for logged-out visitors and
-            // rotated for logged-in users. Sent by JS as X-Bokun-Nonce on /reserve.
-            'nonce'      => wp_create_nonce('bokun_skipcash_booking_nonce'),
-            'wpRestNonce' => wp_create_nonce('wp_rest'),
-            'currency'   => get_option('bokun_skipcash_currency', 'QAR'),
-            'timeoutMin' => defined('BOKUN_SKIPCASH_TIMEOUT_MINUTES') ? BOKUN_SKIPCASH_TIMEOUT_MINUTES : 30,
-        );
-
-        if (!$printed) {
-            $printed = true;
-            // Normal path: emitted right before the script tag when the action
-            // order is standard (enqueue during wp_enqueue_scripts).
-            wp_localize_script('bokun-booking-scripts', 'BokunSkipCashConfig', $config);
-        }
-
-        // Fallback path: inline boot snippet in <head>, guaranteed to be printed
-        // even if the script handle was registered late or the page was cached.
-        wp_add_inline_script('bokun-booking-scripts', $this->build_config_bootstrap_js($config), 'before');
+        // Normal path: emitted right before the script tag when the action
+        // order is standard (enqueue during wp_enqueue_scripts). Nonces are
+        // generated lazily inside wp_localize_script's own print callback, so
+        // this data is fresh PER REQUEST — a full-page cache must never store
+        // an HTML document containing it (see protect_html_from_caching()).
+        wp_localize_script('bokun-booking-scripts', 'BokunSkipCashConfig', $this->get_frontend_config());
     }
 
     /**
-     * Idempotent JS that defines window.BokunSkipCashConfig if nothing else did.
+     * Config payload for the booking frontend. Single source of truth so the
+     * localized object and the head bootstrap always agree.
      */
-    private function build_config_bootstrap_js(array $config) {
-        return 'window.BokunSkipCashConfig = window.BokunSkipCashConfig || ' . wp_json_encode($config) . ';';
+    public function get_frontend_config() {
+        return array(
+            'ajaxUrl'     => admin_url('admin-ajax.php'),
+            'restUrl'     => esc_url_raw(rest_url('bokun-skipcash/v1/')),
+            // Fresh nonce per request, valid ~24h for logged-out visitors and
+            // rotated for logged-in users. Sent by JS as X-Bokun-Nonce on /reserve.
+            'nonce'       => wp_create_nonce('bokun_skipcash_booking_nonce'),
+            'wpRestNonce' => wp_create_nonce('wp_rest'),
+            'currency'    => get_option('bokun_skipcash_currency', 'QAR'),
+            'timeoutMin'  => defined('BOKUN_SKIPCASH_TIMEOUT_MINUTES') ? BOKUN_SKIPCASH_TIMEOUT_MINUTES : 30,
+        );
+    }
+
+    /**
+     * CACHE-SAFE BOOTSTRAP (the real fix for "Security check failed" on cached pages).
+     *
+     * The previous fallback injected `window.BokunSkipCashConfig = ... || {...}`
+     * into <head> WITH NONCES BAKED IN AT RENDER TIME. A full-page cache then
+     * served that same HTML for hours: every visitor got the stale baked nonces
+     * -> /reserve rejected them -> bokun_invalid_nonce 403. Worse, those baked
+     * nonces belonged to whoever triggered the cache regeneration (a logged-in
+     * admin's nonce is tied to their session/user ID), so anonymous visitors
+     * could NEVER validate them, and refreshing only helped until the cache
+     * refilled with the same poisoned copy.
+     *
+     * This hook prints ONLY STATIC fields (URLs, currency, timeout) plus a
+     * placeholder nonce. It contains no per-session data at all, so it is safe
+     * to cache indefinitely. The JS detects the placeholder and fetches a live
+     * nonce from GET /nonce (which sends no-store headers) before posting —
+     * see ensureFreshNonces() in assets/js/bokun-booking.js.
+     */
+    public function print_config_bootstrap() {
+        if (is_admin()) {
+            return;
+        }
+        $config = $this->get_frontend_config();
+        // Replace the per-session values with cache-safe placeholders. JS treats
+        // 'STALE_BOOTSTRAP' as "must refresh via /nonce endpoint".
+        $config['nonce']       = 'STALE_BOOTSTRAP';
+        $config['wpRestNonce'] = 'STALE_BOOTSTRAP';
+        echo '<script id="bokun-skipcash-config-boot">window.BokunSkipCashConfig=window.BokunSkipCashConfig||'
+            . wp_json_encode($config) . ';</script>' . "\n";
+    }
+
+    /**
+     * Tell caches not to store pages carrying live nonces, and send no-store
+     * headers on our own dynamic endpoints.
+     *
+     * Booking pages embed a per-session nonce in the localized script data, so
+     * a byte-identical cached copy served to another visitor carries a nonce
+     * they cannot use. Sending `Cache-Control: no-store` (plus the legacy
+     * `X-WP-Nonce-Stale: 1` marker some setups key on) instructs compliant
+     * caches (WP Super Cache, W3TC, LiteSpeed, nginx fastcgi_cache rules that
+     * honor header passthrough) to bypass storage for these URLs.
+     *
+     * NOTE: aggressive proxies may still ignore these headers. That is why the
+     * runtime self-heal above (JS re-fetching a fresh nonce on demand) remains
+     * the primary defence — the two mechanisms together mean a stale cached
+     * page can no longer produce the user-visible "Security check failed" error.
+     */
+    public function protect_html_from_caching() {
+        if (is_singular() && has_shortcode((string) get_post_field('post_content', get_queried_object_id()), 'bokun_booking')) {
+            nocache_headers();
+            header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+            header('Pragma: no-cache');
+        }
     }
 }
 

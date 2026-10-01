@@ -1653,14 +1653,31 @@ var isPastCutoff = function(s, dStr) {
                 logDebug('Initiating Checkout Reserve: ' + url);
 
                 // The /reserve REST endpoint enforces a valid WP nonce via the
-                // X-Bokun-Nonce header ( BokunSkipCashConfig.nonce from wp_localize_script ).
-                // Without it the permission callback rejects the request with
-                // "Security check failed. Please refresh the page and try again."
+                // X-Bokun-Nonce header ( BokunSkipCashConfig.nonce ).
+                // Cache note: on full-page-cached HTML the embedded nonce is stale or
+                // the placeholder 'STALE_BOOTSTRAP' from our cache-safe head bootstrap.
+                // In both cases we refresh via GET /nonce before posting, so cached
+                // pages never surface "Security check failed" to the user.
                 var bkNonce = (window.BokunSkipCashConfig && window.BokunSkipCashConfig.nonce) ? window.BokunSkipCashConfig.nonce : '';
                 var wpRestNonce = (window.BokunSkipCashConfig && window.BokunSkipCashConfig.wpRestNonce) ? window.BokunSkipCashConfig.wpRestNonce : '';
-                if (!bkNonce) {
-                    logDebug('Booking nonce missing - BokunSkipCashConfig not loaded.', true);
-                }
+
+                var nonceIsUsable = function (n) {
+                    return !!n && n !== 'STALE_BOOTSTRAP';
+                };
+
+                var fetchFreshNonces = function () {
+                    return fetch(buildEndpointUrl('nonce', ''), { credentials: 'same-origin' })
+                        .then(function (r) { return r.json(); })
+                        .then(function (n) {
+                            if (!n || !n.nonce) throw new Error('Could not refresh security token');
+                            if (window.BokunSkipCashConfig) {
+                                window.BokunSkipCashConfig.nonce = n.nonce;
+                                window.BokunSkipCashConfig.wpRestNonce = n.wpRestNonce || n.nonce;
+                            }
+                            wpRestNonce = n.wpRestNonce || n.nonce;
+                            return n.nonce;
+                        });
+                };
 
                 var submitReserve = function (nonceValue, isRetry) {
                     fetch(url, {
@@ -1680,19 +1697,9 @@ var isPastCutoff = function(s, dStr) {
                         // re-fetch a fresh nonce from the server and retry once.
                         if (!isRetry && res.status === 403 && j.code === 'bokun_invalid_nonce') {
                             logDebug('Nonce rejected by server - refreshing nonce and retrying once.');
-                            return fetch(buildEndpointUrl('nonce', ''), { credentials: 'same-origin' })
-                                .then(function(r) { return r.json(); })
-                                .then(function(n) {
-                                    if (n && n.nonce) {
-                                        if (window.BokunSkipCashConfig) {
-                                            window.BokunSkipCashConfig.nonce = n.nonce;
-                                            window.BokunSkipCashConfig.wpRestNonce = n.wpRestNonce || n.nonce;
-                                        }
-                                        wpRestNonce = n.wpRestNonce || n.nonce;
-                                        return submitReserve(n.nonce, true);
-                                    }
-                                    throw new Error('Could not refresh security token');
-                                });
+                            return fetchFreshNonces().then(function (fresh) {
+                                return submitReserve(fresh, true);
+                            });
                         }
                         var targetUrl = j.payUrl || j.redirectUrl || j.paymentUrl;
                         if (j.success && targetUrl) {
@@ -1714,7 +1721,25 @@ var isPastCutoff = function(s, dStr) {
                     });
                 };
 
-                submitReserve(bkNonce, false);
+                // Proactively refresh nonces when the embedded one is missing or a
+                // cache placeholder (page HTML served from full-page cache). The GET
+                // /nonce endpoint sends no-store headers, so its response is always live.
+                var beginReserve = function () {
+                    if (nonceIsUsable(bkNonce)) {
+                        submitReserve(bkNonce, false);
+                    } else {
+                        logDebug('Embedded nonce missing/stale - fetching fresh nonce before reserving.');
+                        fetchFreshNonces()
+                            .then(function (fresh) { submitReserve(fresh, true); })
+                            .catch(function (err) {
+                                logDebug('Could not obtain security token: ' + err.message, true);
+                                if (DOM.errMsg) DOM.errMsg.textContent = 'Connection error: could not verify security token. Please try again.';
+                                DOM.btnCheckout.disabled = false;
+                            });
+                    }
+                };
+
+                beginReserve();
             }
         });
     }

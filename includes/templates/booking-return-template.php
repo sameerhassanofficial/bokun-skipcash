@@ -90,14 +90,14 @@ get_header();
             </div>
             <h2 id="bokun-status-heading" style="color: #111827; margin: 0 0 10px; font-size: 24px; font-weight: 700;">Finalizing Booking with Bókun...</h2>
             <p id="bokun-status-msg" style="color: #4b5563; font-size: 15px; line-height: 1.6; margin-bottom: 24px;">
-                We are verifying your payment and confirming your reservation <code><?php echo esc_html($code); ?></code> in Bókun. Please wait a moment while your tickets are being generated.
+                We are verifying your payment and confirming your reservation <code><?php echo esc_html($code); ?></code> in Bókun automatically. Please keep this page open for a moment while your tickets are being generated.
             </p>
-            
-            <div style="margin-bottom: 24px;">
-                <button type="button" id="bokun-manual-verify-btn" onclick="triggerManualVerification()" style="background: #8A1538; color: #ffffff; border: none; padding: 12px 24px; border-radius: 8px; font-weight: 600; font-size: 14px; cursor: pointer;">
-                    Confirm & Activate Tickets Now
-                </button>
-            </div>
+
+            <?php if ($verify_error === 'unauthorized'): ?>
+            <p style="font-size: 13px; color: #b45309; background: #fffbeb; border: 1px solid #fde68a; border-radius: 8px; padding: 10px 14px; display: inline-block; margin-bottom: 18px;">
+                For your security we could not verify this session automatically. Your booking reference is below — Bókun will email your ticket once payment clears.
+            </p>
+            <?php endif; ?>
 
             <p style="font-size: 13px; color: #9ca3af;">Reference Code: <strong style="color: #4b5563; font-family: monospace;"><?php echo esc_html($code); ?></strong></p>
         </div>
@@ -112,7 +112,7 @@ get_header();
         <script>
         (function() {
             var checkCount = 0;
-            var maxChecks = 15;
+            var maxChecks = 30;
             var bookingCode = <?php echo wp_json_encode($code); ?>;
             var restBase = <?php echo wp_json_encode(esc_url_raw(rest_url('bokun-skipcash/v1/'))); ?>;
             var bookingToken = <?php echo wp_json_encode($verify_token); ?>;
@@ -132,24 +132,40 @@ get_header();
                 );
             }
 
+            function onConfirmed() {
+                var h = document.getElementById('bokun-status-heading');
+                var m = document.getElementById('bokun-status-msg');
+                var s = document.getElementById('bokun-spinner-icon');
+                if (s) { s.innerText = '✓'; s.style.animation = 'none'; }
+                if (h) h.innerText = 'Booking Confirmed!';
+                if (m) m.innerText = 'Payment confirmed! Loading ticket details...';
+                setTimeout(function() {
+                    window.location.reload();
+                }, 500);
+            }
+
+            // Fully automatic confirmation: poll the server, which verifies the
+            // payment with SkipCash and confirms the reservation in Bókun itself.
+            // No customer interaction ("confirm/activate" click) is required —
+            // matching the original gateway's hands-off flow.
             function checkConfirmation() {
                 checkCount++;
                 fetch(verifyUrl, { cache: 'no-store', credentials: 'same-origin', headers: verifyHeaders })
                 .then(function(res) { return res.json(); })
                 .then(function(data) {
                     if (isBookingConfirmed(data)) {
-                        var h = document.getElementById('bokun-status-heading');
-                        var m = document.getElementById('bokun-status-msg');
-                        if (h) h.innerText = 'Booking Confirmed!';
-                        if (m) m.innerText = 'Payment confirmed! Loading ticket details...';
-                        setTimeout(function() {
-                            window.location.reload();
-                        }, 500);
+                        onConfirmed();
                     } else if (checkCount < maxChecks) {
                         setTimeout(checkConfirmation, 2000);
                     } else {
-                        var btn = document.getElementById('bokun-manual-verify-btn');
-                        if (btn) btn.innerText = 'Check Status Again';
+                        var h = document.getElementById('bokun-status-heading');
+                        var m = document.getElementById('bokun-status-msg');
+                        var s = document.getElementById('bokun-spinner-icon');
+                        if (s) { s.innerText = '✉'; s.style.animation = 'none'; }
+                        if (h) h.innerText = 'Payment Received — Finalizing';
+                        if (m) m.innerHTML = 'Your payment went through and your booking (<code>' +
+                            bookingCode.replace(/[^\w-]/g, '') +
+                            '</code>) is being finalized in Bókun. This can take a few minutes; your ticket voucher will arrive by email shortly. You can safely close this page.';
                     }
                 })
                 .catch(function() {
@@ -158,44 +174,6 @@ get_header();
                     }
                 });
             }
-
-            window.triggerManualVerification = function() {
-                var btn = document.getElementById('bokun-manual-verify-btn');
-                if (btn) {
-                    btn.disabled = true;
-                    btn.innerText = 'Checking with Bókun...';
-                }
-                fetch(verifyUrl, { cache: 'no-store', credentials: 'same-origin', headers: verifyHeaders })
-                .then(function(res) { return res.json(); })
-                .then(function(data) {
-                    if (isBookingConfirmed(data)) {
-                        var h = document.getElementById('bokun-status-heading');
-                        var m = document.getElementById('bokun-status-msg');
-                        if (h) h.innerText = 'Booking Confirmed!';
-                        if (m) m.innerText = 'Reservation confirmed in Bókun! Loading tickets...';
-                        setTimeout(function() {
-                            window.location.reload();
-                        }, 400);
-                    } else {
-                        var msgElem = document.getElementById('bokun-status-msg');
-                        if (msgElem) {
-                            msgElem.innerText = 'Payment received. Finalizing reservation with Bókun, please wait...';
-                        }
-                        if (btn) {
-                            btn.disabled = false;
-                            btn.innerText = 'Check Status Again';
-                        }
-                        // Retry check in 1.5s
-                        setTimeout(checkConfirmation, 1500);
-                    }
-                })
-                .catch(function() {
-                    if (btn) {
-                        btn.disabled = false;
-                        btn.innerText = 'Check Status Again';
-                    }
-                });
-            };
 
             // Start auto-checking immediately
             setTimeout(checkConfirmation, 500);
